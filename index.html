@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Light Show Editor</title>
+
+    <!-- Trunk builds the Rust crate (Bevy app) to wasm and injects the loader.
+         data-wasm-opt="0" keeps dev rebuilds fast; release builds optimize. -->
+    <link data-trunk rel="rust" data-wasm-opt="0" />
+    <!-- Copy the Blender glTF scene (and any assets) into the served site. -->
+    <link data-trunk rel="copy-dir" href="assets" />
+    <base data-trunk-public-url />
+
+    <style>
+        html, body { overflow: hidden; margin: 0; padding: 0; height: 100%; width: 100%; background: #0e0e12; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas_id"></canvas>
+</body>
+</html>

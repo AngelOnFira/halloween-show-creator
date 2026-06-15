@@ -1,46 +1,60 @@
-mod module_bindings;
-use module_bindings::*;
-use std::env;
+//! Light Show Editor — a browser (wasm) app hosted by Bevy, with the egui UI
+//! drawn as an overlay via bevy_egui, backed by SpacetimeDB (every edit stored
+//! as an append-only event → perfect version control + time travel). A 3D
+//! viewport's fixtures light up to mirror the timeline.
 
-use spacetimedb_sdk::{DbContext, Table};
+mod conn;
+mod logic;
+mod module_bindings;
+mod scene;
+mod state;
+mod ui;
+
+use bevy::prelude::*;
+use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
+
+use state::{AppState, HeldGrid, Playback};
 
 fn main() {
-    // The URI of the SpacetimeDB instance hosting our chat module.
-    let host: String = env::var("SPACETIMEDB_HOST").unwrap_or("http://localhost:3000".to_string());
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
 
-    // The module name we chose when we published our module.
-    let db_name: String = env::var("SPACETIMEDB_DB_NAME").unwrap_or("my-db".to_string());
-
-    // Connect to the database
-    let conn = DbConnection::builder()
-        .with_database_name(db_name)
-        .with_uri(host)
-        .on_connect(|_, _, _| {
-            println!("Connected to SpacetimeDB");
-        })
-        .on_connect_error(|_ctx, e| {
-            eprintln!("Connection error: {:?}", e);
-            std::process::exit(1);
-        })
-        .build()
-        .expect("Failed to connect");
-
-    conn.run_threaded();
-
-    // Subscribe to the person table
-    conn.subscription_builder()
-        .on_applied(|_ctx| println!("Subscripted to the person table"))
-        .on_error(|_ctx, e| eprintln!("There was an error when subscring to the person table: {e}"))
-        .add_query(|q| q.from.person())
-        .subscribe();
-
-    // Register a callback for when rows are inserted into the person table
-    conn.db().person().on_insert(|_ctx, person| {
-        println!("New person: {}", person.name);
-    });
-
-    // Keep the main thread alive so the connection stays open
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    App::new()
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        canvas: Some("#the_canvas_id".into()),
+                        fit_canvas_to_parent: true,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                // On wasm the dev server answers `.meta` requests with a 200 SPA
+                // fallback; without this Bevy tries to parse that as asset meta
+                // and the glTF load fails.
+                .set(AssetPlugin {
+                    meta_check: bevy::asset::AssetMetaCheck::Never,
+                    ..default()
+                }),
+        )
+        .add_plugins(EguiPlugin::default())
+        .init_resource::<AppState>()
+        .init_resource::<HeldGrid>()
+        .init_resource::<Playback>()
+        .add_systems(Startup, scene::setup_scene_3d)
+        .add_systems(Startup, conn::setup_connection)
+        .add_systems(PreUpdate, conn::pump_connection)
+        .add_systems(Update, scene::spawn_gltf_fixtures)
+        .add_systems(
+            Update,
+            (
+                scene::recompute_held,
+                scene::playback_advance,
+                scene::apply_lights,
+            )
+                .chain(),
+        )
+        .add_systems(EguiPrimaryContextPass, ui::ui_system)
+        .run();
 }

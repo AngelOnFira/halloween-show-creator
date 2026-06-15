@@ -393,16 +393,18 @@ pub fn on_disconnect(ctx: &ReducerContext) { ... }
 
 ## Views
 
+Views must access tables via **indexed lookups only** (primary key, `#[unique]`, or `#[index(btree)]`). `.iter()` / full scans are rejected — the view engine can't incrementally maintain them.
+
 ```rust
-// Anonymous view (same result for all clients):
+// Anonymous view (computed ONCE, shared across all clients) — prefer this:
 use spacetimedb::{view, AnonymousViewContext};
 
 #[view(accessor = active_users, public)]
 fn active_users(ctx: &AnonymousViewContext) -> Vec<Entity> {
-    ctx.db.entity().iter().filter(|e| e.active).collect()
+    ctx.db.entity().active().filter(true).collect()  // btree index on `active`, not .iter()
 }
 
-// Per-user view (result varies by sender):
+// Per-user view (result varies by sender, materialized PER subscriber — costly at scale):
 use spacetimedb::{view, ViewContext};
 
 #[view(accessor = my_profile, public)]
@@ -410,6 +412,8 @@ fn my_profile(ctx: &ViewContext) -> Option<Entity> {
     ctx.db.entity().identity().find(ctx.sender())
 }
 ```
+
+Prefer views over RLS (`#[client_visibility_filter]`) for access control — RLS is experimental/unstable.
 
 ## Reducer Context API
 
@@ -538,3 +542,47 @@ pub fn add_record(ctx: &ReducerContext, value: u32) {
     });
 }
 ```
+
+## Event Tables
+
+Add the `event` flag for ephemeral rows that broadcast to clients but never persist (damage numbers, kill/chat notifications, telemetry). Inserted and dropped within the same transaction; constraints/indexes are enforced per-transaction. The `event` flag can't be toggled in a migration, and event tables can't be used in views or as the lookup side of subscription joins.
+
+```rust
+#[spacetimedb::table(accessor = damage_event, public, event)]
+pub struct DamageEvent { pub target: Identity, pub damage: u32 }
+// Client: observe via on_insert ONLY — iter()/count() are always empty; no on_update/on_delete.
+```
+
+## Client SDK (Rust)
+
+Client modules use the `spacetimedb-sdk` crate (NOT `spacetimedb`). Key rules that differ from the server side:
+
+```rust
+let conn = DbConnection::builder()
+    .with_uri("http://localhost:3000")
+    .with_module_name("my-module")
+    .on_connect(|conn, identity, token| {
+        // MUST subscribe inside on_connect — never before the connection is established.
+        conn.subscription_builder()
+            .on_applied(|ctx| println!("Ready!"))
+            .add_query(|q| q.from.shop_items().r#where(|r| r.required_level.lte(5u32)))
+            .subscribe();
+    })
+    .build()?;
+
+// MUST advance the connection or NO callbacks ever fire:
+conn.run_threaded();   // background thread (simplest) — or run_async().await, or frame_tick()? in a game loop
+```
+
+- `r#where` is mandatory in query closures (`where` is a Rust keyword).
+- The client SDK uses **blocking I/O** — use `spawn_blocking` or a dedicated thread if mixing with Tokio/async-std.
+- When swapping subscriptions, **subscribe to the new query first, then unsubscribe the old** (avoids row churn).
+
+## High-Value Gotchas
+
+- `insert()` returns the **inserted row, not the id** — get the auto-inc value via `let id = ctx.db.task().insert(...).id;`.
+- Multi-column `#[unique]` is **not supported** — use a single auto-inc PK plus a btree index over those columns.
+- `ScheduleAt::Time(...)` not `::At(...)`; the scheduled-table column type is `scheduled(...)` not `schedule(...)`.
+- `#[default(...)]` requires a **const-evaluable** expression — no `.to_string()` / `String::new()`; new migration columns need a `#[default]` and must be appended last.
+- `Identity` → `String` is `identity.to_hex().to_string()` (`.to_hex()` alone returns `HexString<32>`).
+- Procedures (HTTP/side effects, beta) require `features = ["unstable"]` in Cargo.toml, take `&mut ProcedureContext`, use `ctx.with_tx(|tx| ...)` for DB access, and their closures **may retry — keep them idempotent** (derive all values from inside the closure).

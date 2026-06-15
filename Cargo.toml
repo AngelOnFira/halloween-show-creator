@@ -7,4 +7,45 @@ edition = "2021"
 exclude = ["spacetimedb"]
 
 [dependencies]
-spacetimedb-sdk = { version = "2.5.*" }
+# Trimmed Bevy feature set (default features can't resolve on 0.18.1 — the
+# `bevy_animation` crate has no stable 0.18 release, only a prerelease).
+bevy = { version = "0.18", default-features = false, features = [
+    "bevy_winit",
+    "bevy_window",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_scene",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_state",
+    "std",
+    "webgl2",
+    "png",
+    "tonemapping_luts",
+] }
+bevy_egui = "0.39"
+log = "0.4"
+
+# Browser (wasm) build: the SpacetimeDB Rust SDK only works in the browser with
+# its `browser` feature. The connection is driven by `frame_tick()` in a Bevy
+# system; it is a NonSend resource because `DbConnection` is `Rc`-backed.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+spacetimedb-sdk = { version = "2.5", features = ["browser"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+console_error_panic_hook = "0.1"
+
+# Native build is for fast `cargo check`/a desktop dev window; the SpacetimeDB
+# connection is wasm-only (see src/conn.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+spacetimedb-sdk = { version = "2.5" }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2

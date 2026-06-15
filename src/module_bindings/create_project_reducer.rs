@@ -6,44 +6,52 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
-pub(super) struct AddArgs {
+pub(super) struct CreateProjectArgs {
     pub name: String,
+    pub num_lights: u32,
+    pub num_frames: u32,
 }
 
-impl From<AddArgs> for super::Reducer {
-    fn from(args: AddArgs) -> Self {
-        Self::Add { name: args.name }
+impl From<CreateProjectArgs> for super::Reducer {
+    fn from(args: CreateProjectArgs) -> Self {
+        Self::CreateProject {
+            name: args.name,
+            num_lights: args.num_lights,
+            num_frames: args.num_frames,
+        }
     }
 }
 
-impl __sdk::InModule for AddArgs {
+impl __sdk::InModule for CreateProjectArgs {
     type Module = super::RemoteModule;
 }
 
 #[allow(non_camel_case_types)]
-/// Extension trait for access to the reducer `add`.
+/// Extension trait for access to the reducer `create_project`.
 ///
 /// Implemented for [`super::RemoteReducers`].
-pub trait add {
-    /// Request that the remote module invoke the reducer `add` to run as soon as possible.
+pub trait create_project {
+    /// Request that the remote module invoke the reducer `create_project` to run as soon as possible.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and this method provides no way to listen for its completion status.
-    /// /// Use [`add:add_then`] to run a callback after the reducer completes.
-    fn add(&self, name: String) -> __sdk::Result<()> {
-        self.add_then(name, |_, _| {})
+    /// /// Use [`create_project:create_project_then`] to run a callback after the reducer completes.
+    fn create_project(&self, name: String, num_lights: u32, num_frames: u32) -> __sdk::Result<()> {
+        self.create_project_then(name, num_lights, num_frames, |_, _| {})
     }
 
-    /// Request that the remote module invoke the reducer `add` to run as soon as possible,
+    /// Request that the remote module invoke the reducer `create_project` to run as soon as possible,
     /// registering `callback` to run when we are notified that the reducer completed.
     ///
     /// This method returns immediately, and errors only if we are unable to send the request.
     /// The reducer will run asynchronously in the future,
     ///  and its status can be observed with the `callback`.
-    fn add_then(
+    fn create_project_then(
         &self,
         name: String,
+        num_lights: u32,
+        num_frames: u32,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
@@ -51,15 +59,24 @@ pub trait add {
     ) -> __sdk::Result<()>;
 }
 
-impl add for super::RemoteReducers {
-    fn add_then(
+impl create_project for super::RemoteReducers {
+    fn create_project_then(
         &self,
         name: String,
+        num_lights: u32,
+        num_frames: u32,
 
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
     ) -> __sdk::Result<()> {
-        self.imp.invoke_reducer_with_callback(AddArgs { name }, callback)
+        self.imp.invoke_reducer_with_callback(
+            CreateProjectArgs {
+                name,
+                num_lights,
+                num_frames,
+            },
+            callback,
+        )
     }
 }

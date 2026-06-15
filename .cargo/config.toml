@@ -1,0 +1,5 @@
+# getrandom 0.3 needs this cfg to use the browser backend on wasm32-unknown-unknown.
+# spacetimedb-sdk's `browser` feature pulls getrandom with `wasm_js`, but the
+# backend still has to be selected with this flag. Trunk/cargo pick it up here.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

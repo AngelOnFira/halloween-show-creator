@@ -1,0 +1,7 @@
+[build]
+target = "index.html"
+
+[serve]
+port = 8123
+addresses = ["127.0.0.1"]
+open = false
