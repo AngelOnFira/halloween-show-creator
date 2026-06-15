@@ -27,6 +27,8 @@ bevy = { version = "0.18", default-features = false, features = [
 ] }
 bevy_egui = "0.39"
 log = "0.4"
+# Pure-Rust FFT for the spectral-flux beat detector (wasm-compatible).
+rustfft = "6"
 
 # Browser (wasm) build: the SpacetimeDB Rust SDK only works in the browser with
 # its `browser` feature. The connection is driven by `frame_tick()` in a Bevy
@@ -35,7 +37,23 @@ log = "0.4"
 spacetimedb-sdk = { version = "2.5", features = ["browser"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Storage"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+# Async file picker (wasm: an <input type=file> under the hood).
+rfd = "0.15"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Storage",
+    # Web Audio: decode uploaded songs and play them back in sync.
+    "AudioContext",
+    "BaseAudioContext",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
+    "AudioDestinationNode",
+    "AudioContextState",
+    "AudioNode",
+    "AudioParam",
+] }
 console_error_panic_hook = "0.1"
 
 # Native build is for fast `cargo check`/a desktop dev window; the SpacetimeDB

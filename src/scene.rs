@@ -254,7 +254,7 @@ pub fn playback_advance(
     mut pb: ResMut<Playback>,
     grid: Res<HeldGrid>,
 ) {
-    if !pb.playing || pb.fps <= 0.0 || grid.nf == 0 {
+    if !pb.playing || pb.fps <= 0.0 || grid.nf == 0 || pb.audio_driven {
         return;
     }
     pb.accumulator += time.delta_secs() * pb.fps;

@@ -3,6 +3,7 @@
 //! as an append-only event → perfect version control + time travel). A 3D
 //! viewport's fixtures light up to mirror the timeline.
 
+mod audio;
 mod conn;
 mod logic;
 mod module_bindings;
@@ -44,12 +45,23 @@ fn main() {
         .init_resource::<Playback>()
         .add_systems(Startup, scene::setup_scene_3d)
         .add_systems(Startup, conn::setup_connection)
+        .add_systems(Startup, audio::setup_audio)
         .add_systems(PreUpdate, conn::pump_connection)
         .add_systems(Update, scene::spawn_gltf_fixtures)
         .add_systems(
             Update,
             (
+                conn::sync_subscriptions,
+                audio::drive_upload,
+                audio::ensure_audio_buffer,
+                audio::sync_tempo,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
                 scene::recompute_held,
+                audio::audio_playback_sync,
                 scene::playback_advance,
                 scene::apply_lights,
             )

@@ -15,8 +15,9 @@ pub struct AppState {
     pub history_pos: Option<u64>,
     pub new_name: String,
     pub new_lights: u32,
-    pub new_frames: u32,
     pub last_error: Option<String>,
+    /// Auto-generate pattern: 0 = strobe all, 1 = chase, 2 = alternate.
+    pub autogen_pattern: u8,
 }
 
 impl Default for AppState {
@@ -27,8 +28,8 @@ impl Default for AppState {
             history_pos: None,
             new_name: "My Light Show".to_owned(),
             new_lights: 8,
-            new_frames: 64,
             last_error: None,
+            autogen_pattern: 0,
         }
     }
 }
@@ -40,6 +41,9 @@ pub struct Playback {
     pub fps: f32,
     pub looping: bool,
     pub accumulator: f32,
+    /// Set each frame by `audio::audio_playback_sync` when the playhead is being
+    /// driven by the audio clock; suppresses the real-time `playback_advance`.
+    pub audio_driven: bool,
 }
 
 impl Default for Playback {
@@ -49,6 +53,7 @@ impl Default for Playback {
             fps: 30.0,
             looping: true,
             accumulator: 0.0,
+            audio_driven: false,
         }
     }
 }

@@ -7,18 +7,32 @@
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 pub mod append_edit_reducer;
+pub mod append_song_chunk_reducer;
+pub mod begin_song_upload_reducer;
 pub mod create_project_reducer;
+pub mod delete_song_reducer;
 pub mod edit_log_table;
 pub mod edit_type;
 pub mod project_table;
 pub mod project_type;
+pub mod song_chunk_table;
+pub mod song_chunk_type;
+pub mod song_table;
+pub mod song_type;
 
 pub use append_edit_reducer::append_edit;
+pub use append_song_chunk_reducer::append_song_chunk;
+pub use begin_song_upload_reducer::begin_song_upload;
 pub use create_project_reducer::create_project;
+pub use delete_song_reducer::delete_song;
 pub use edit_log_table::*;
 pub use edit_type::Edit;
 pub use project_table::*;
 pub use project_type::Project;
+pub use song_chunk_table::*;
+pub use song_chunk_type::SongChunk;
+pub use song_table::*;
+pub use song_type::Song;
 
 #[derive(Clone, PartialEq, Debug)]
 
@@ -34,10 +48,30 @@ pub enum Reducer {
         frame: u32,
         state: u8,
     },
+    AppendSongChunk {
+        song_id: u64,
+        idx: u32,
+        data: Vec<u8>,
+    },
+    BeginSongUpload {
+        project_id: u64,
+        name: String,
+        mime: String,
+        byte_len: u64,
+        num_chunks: u32,
+        duration_ms: u32,
+        fps_used: f32,
+        beats_frames: Vec<u32>,
+        bpm: f32,
+        first_beat_ms: u32,
+    },
     CreateProject {
         name: String,
         num_lights: u32,
         num_frames: u32,
+    },
+    DeleteSong {
+        project_id: u64,
     },
 }
 
@@ -49,7 +83,10 @@ impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
             Reducer::AppendEdit { .. } => "append_edit",
+            Reducer::AppendSongChunk { .. } => "append_song_chunk",
+            Reducer::BeginSongUpload { .. } => "begin_song_upload",
             Reducer::CreateProject { .. } => "create_project",
+            Reducer::DeleteSong { .. } => "delete_song",
             _ => unreachable!(),
         }
     }
@@ -67,6 +104,36 @@ impl __sdk::Reducer for Reducer {
                 frame: frame.clone(),
                 state: state.clone(),
             }),
+            Reducer::AppendSongChunk { song_id, idx, data } => {
+                __sats::bsatn::to_vec(&append_song_chunk_reducer::AppendSongChunkArgs {
+                    song_id: song_id.clone(),
+                    idx: idx.clone(),
+                    data: data.clone(),
+                })
+            }
+            Reducer::BeginSongUpload {
+                project_id,
+                name,
+                mime,
+                byte_len,
+                num_chunks,
+                duration_ms,
+                fps_used,
+                beats_frames,
+                bpm,
+                first_beat_ms,
+            } => __sats::bsatn::to_vec(&begin_song_upload_reducer::BeginSongUploadArgs {
+                project_id: project_id.clone(),
+                name: name.clone(),
+                mime: mime.clone(),
+                byte_len: byte_len.clone(),
+                num_chunks: num_chunks.clone(),
+                duration_ms: duration_ms.clone(),
+                fps_used: fps_used.clone(),
+                beats_frames: beats_frames.clone(),
+                bpm: bpm.clone(),
+                first_beat_ms: first_beat_ms.clone(),
+            }),
             Reducer::CreateProject {
                 name,
                 num_lights,
@@ -76,6 +143,11 @@ impl __sdk::Reducer for Reducer {
                 num_lights: num_lights.clone(),
                 num_frames: num_frames.clone(),
             }),
+            Reducer::DeleteSong { project_id } => {
+                __sats::bsatn::to_vec(&delete_song_reducer::DeleteSongArgs {
+                    project_id: project_id.clone(),
+                })
+            }
             _ => unreachable!(),
         }
     }
@@ -87,6 +159,8 @@ impl __sdk::Reducer for Reducer {
 pub struct DbUpdate {
     edit_log: __sdk::TableUpdate<Edit>,
     project: __sdk::TableUpdate<Project>,
+    song: __sdk::TableUpdate<Song>,
+    song_chunk: __sdk::TableUpdate<SongChunk>,
 }
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -101,6 +175,12 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "project" => db_update
                     .project
                     .append(project_table::parse_table_update(table_update)?),
+                "song" => db_update
+                    .song
+                    .append(song_table::parse_table_update(table_update)?),
+                "song_chunk" => db_update
+                    .song_chunk
+                    .append(song_chunk_table::parse_table_update(table_update)?),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -133,6 +213,12 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.project = cache
             .apply_diff_to_table::<Project>("project", &self.project)
             .with_updates_by_pk(|row| &row.id);
+        diff.song = cache
+            .apply_diff_to_table::<Song>("song", &self.song)
+            .with_updates_by_pk(|row| &row.id);
+        diff.song_chunk = cache
+            .apply_diff_to_table::<SongChunk>("song_chunk", &self.song_chunk)
+            .with_updates_by_pk(|row| &row.id);
 
         diff
     }
@@ -145,6 +231,12 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "project" => db_update
                     .project
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "song" => db_update
+                    .song
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "song_chunk" => db_update
+                    .song_chunk
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => {
                     return Err(
@@ -165,6 +257,12 @@ impl __sdk::DbUpdate for DbUpdate {
                 "project" => db_update
                     .project
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "song" => db_update
+                    .song
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "song_chunk" => db_update
+                    .song_chunk
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => {
                     return Err(
                         __sdk::InternalError::unknown_name("table", unknown, "QueryRows").into(),
@@ -182,6 +280,8 @@ impl __sdk::DbUpdate for DbUpdate {
 pub struct AppliedDiff<'r> {
     edit_log: __sdk::TableAppliedDiff<'r, Edit>,
     project: __sdk::TableAppliedDiff<'r, Project>,
+    song: __sdk::TableAppliedDiff<'r, Song>,
+    song_chunk: __sdk::TableAppliedDiff<'r, SongChunk>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
 
@@ -197,6 +297,8 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     ) {
         callbacks.invoke_table_row_callbacks::<Edit>("edit_log", &self.edit_log, event);
         callbacks.invoke_table_row_callbacks::<Project>("project", &self.project, event);
+        callbacks.invoke_table_row_callbacks::<Song>("song", &self.song, event);
+        callbacks.invoke_table_row_callbacks::<SongChunk>("song_chunk", &self.song_chunk, event);
     }
 }
 
@@ -859,6 +961,8 @@ impl __sdk::SpacetimeModule for RemoteModule {
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         edit_log_table::register_table(client_cache);
         project_table::register_table(client_cache);
+        song_table::register_table(client_cache);
+        song_chunk_table::register_table(client_cache);
     }
-    const ALL_TABLE_NAMES: &'static [&'static str] = &["edit_log", "project"];
+    const ALL_TABLE_NAMES: &'static [&'static str] = &["edit_log", "project", "song", "song_chunk"];
 }

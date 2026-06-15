@@ -1,0 +1,64 @@
+name: Deploy to GitHub Pages
+
+# Builds the Trunk/Bevy wasm front-end and publishes dist/ to GitHub Pages.
+# The SpacetimeDB module in spacetimedb/ is NOT deployed here — it lives on
+# Maincloud and is published separately with `spacetime publish`.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Allow only one concurrent deployment; cancel in-progress runs for new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Served from a custom domain, so assets are rooted at / (not /<repo>/).
+      - name: Build (release)
+        run: trunk build --release --public-url "/"
+
+      # Custom domain: written into the published output so it persists on every
+      # deploy (otherwise GitHub can drop the Pages custom-domain setting).
+      - name: Add CNAME
+        run: echo "show-creator.forest-anderson.ca" > dist/CNAME
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
