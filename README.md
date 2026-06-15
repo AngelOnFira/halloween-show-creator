@@ -5,6 +5,9 @@ in SpacetimeDB as an immutable, append-only edit** — giving perfect version co
 and time travel for free. A **Bevy** 3D viewport shows the lights and lights them up
 to mirror the timeline as you build the show. Runs entirely in the browser (WASM).
 
+> **Working on this project?** Read **[docs/architecture.md](docs/architecture.md)**
+> first — the locked-in stack, conventions, and the dead ends we already hit.
+
 ## What it does
 
 - **Project picker** — create shows and reopen previous ones. Your identity is a
