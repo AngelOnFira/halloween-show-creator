@@ -14,7 +14,7 @@ mod ui;
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use state::{AppState, HeldGrid, Playback};
+use state::{AppState, FixtureGrid, HeldGrid, Playback};
 
 fn main() {
     #[cfg(target_arch = "wasm32")]
@@ -42,6 +42,7 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .init_resource::<AppState>()
         .init_resource::<HeldGrid>()
+        .init_resource::<FixtureGrid>()
         .init_resource::<Playback>()
         .add_systems(Startup, scene::setup_scene_3d)
         .add_systems(Startup, conn::setup_connection)
@@ -63,10 +64,12 @@ fn main() {
                 scene::recompute_held,
                 audio::audio_playback_sync,
                 scene::playback_advance,
+                scene::recompute_fixtures,
                 scene::apply_lights,
             )
                 .chain(),
         )
+        .add_systems(Update, scene::draw_fixtures)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .run();
 }

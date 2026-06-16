@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 
+use crate::module_bindings::{LaserKeyframe, ProjectorKeyframe, TurretKeyframe};
+
 /// UI / editor state — a direct lift of the original `LightShowApp` fields.
 #[derive(Resource)]
 pub struct AppState {
@@ -72,4 +74,15 @@ pub struct HeldGrid {
     pub head: u64,
     /// Whether we are viewing a past version (read-only).
     pub viewing_history: bool,
+}
+
+/// The rich fixtures (laser / gobo projector / turret) in effect at the current
+/// playhead frame, recomputed once per frame from the keyframe tables (held
+/// semantics: latest keyframe at or before the playhead, per channel). Read by
+/// the 3D render systems. Indexed by channel.
+#[derive(Resource, Default)]
+pub struct FixtureGrid {
+    pub lasers: Vec<Option<LaserKeyframe>>,
+    pub projectors: Vec<Option<ProjectorKeyframe>>,
+    pub turrets: Vec<Option<TurretKeyframe>>,
 }

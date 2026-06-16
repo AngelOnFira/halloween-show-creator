@@ -16,10 +16,15 @@ use bevy::gltf::{Gltf, GltfMesh, GltfNode};
 use bevy::prelude::*;
 
 use crate::conn::{ConnResource, ConnState};
-use crate::logic::{expand_held, fold_keyframes};
+use crate::logic::{expand_held, fold_fixtures, fold_keyframes};
 use crate::module_bindings::*;
-use crate::state::{AppState, HeldGrid, Playback};
+use crate::state::{AppState, FixtureGrid, HeldGrid, Playback};
 use spacetimedb_sdk::{DbContext, Table};
+
+/// Channel counts for the rich fixtures (mirrors the legacy hardware layout).
+const NUM_LASERS: usize = 5;
+const NUM_PROJECTORS: usize = 1;
+const NUM_TURRETS: usize = 4;
 
 /// The bundled scene. Replace this `.glb` with your Blender export (keep the
 /// `Light.<n>` object naming) — trunk copies `assets/` into the served site.
@@ -304,6 +309,129 @@ pub fn apply_lights(
             } else {
                 mat.emissive = LinearRgba::BLACK;
                 mat.base_color = cfg.off_color;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rich fixtures (lasers / gobo projector / turrets), imported from legacy shows
+// and drawn each frame as gizmo lines. View-only: there is no editor for them.
+// ---------------------------------------------------------------------------
+
+/// Fold the per-project fixture keyframe tables down to the state in effect at
+/// the current playhead frame (held semantics), into `FixtureGrid`.
+pub fn recompute_fixtures(
+    conn: NonSend<ConnResource>,
+    app: Res<AppState>,
+    mut fx: ResMut<FixtureGrid>,
+) {
+    let guard = conn.state.borrow();
+    let ConnState::Connected(c) = &*guard else {
+        return;
+    };
+    let Some(pid) = app.open_project else {
+        fx.lasers.clear();
+        fx.projectors.clear();
+        fx.turrets.clear();
+        return;
+    };
+    let frame = app.current_frame;
+
+    let lasers: Vec<LaserKeyframe> = c
+        .db()
+        .laser_kf()
+        .iter()
+        .filter(|r| r.project_id == pid)
+        .collect();
+    fx.lasers = fold_fixtures(&lasers, frame, NUM_LASERS, |r| r.channel, |r| r.frame);
+
+    let projectors: Vec<ProjectorKeyframe> = c
+        .db()
+        .projector_kf()
+        .iter()
+        .filter(|r| r.project_id == pid)
+        .collect();
+    fx.projectors = fold_fixtures(&projectors, frame, NUM_PROJECTORS, |r| r.channel, |r| r.frame);
+
+    let turrets: Vec<TurretKeyframe> = c
+        .db()
+        .turret_kf()
+        .iter()
+        .filter(|r| r.project_id == pid)
+        .collect();
+    fx.turrets = fold_fixtures(&turrets, frame, NUM_TURRETS, |r| r.channel, |r| r.frame);
+}
+
+/// Map a legacy laser galvo point (x,y in 0..=300) onto the projection plane
+/// behind the fixtures.
+fn laser_to_world(x: i16, y: i16) -> Vec3 {
+    let nx = (x as f32 / 300.0 - 0.5) * 10.0;
+    let ny = 0.5 + (y as f32 / 300.0) * 5.0;
+    Vec3::new(nx, ny, -4.0)
+}
+
+/// 3-bit (0..=7) per-channel laser colour → linear-ish display colour.
+fn laser_color(r: u8, g: u8, b: u8) -> Color {
+    Color::srgb(r as f32 / 7.0, g as f32 / 7.0, b as f32 / 7.0)
+}
+
+/// Base (mount) position of turret `i`, spread across the top of the scene.
+fn turret_base(i: usize) -> Vec3 {
+    Vec3::new(-3.0 + i as f32 * 2.0, 5.5, 1.0)
+}
+
+/// Beam direction for a moving head from its DMX pan/tilt bytes.
+fn turret_dir(pan: u8, tilt: u8) -> Vec3 {
+    let yaw = (pan as f32 / 255.0 - 0.5) * std::f32::consts::PI; // ±90°
+    let pitch = (tilt as f32 / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90° downward
+    let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+    (rot * Vec3::NEG_Y).normalize()
+}
+
+/// Gobo projector DMX colour byte → a display colour.
+fn gobo_color(colour: u8) -> Color {
+    Color::hsl((colour as f32 / 255.0) * 360.0, 0.85, 0.6)
+}
+
+/// Draw the rich fixtures for the open project as emissive gizmo lines.
+pub fn draw_fixtures(app: Res<AppState>, fx: Res<FixtureGrid>, mut gizmos: Gizmos) {
+    if app.open_project.is_none() {
+        return;
+    }
+
+    // Lasers: each active laser draws its path as a colour-graded line strip.
+    for laser in fx.lasers.iter().flatten() {
+        if !laser.enable || laser.points.len() < 2 {
+            continue;
+        }
+        let pts = laser
+            .points
+            .iter()
+            .map(|p| (laser_to_world(p.x, p.y), laser_color(p.r, p.g, p.b)));
+        gizmos.linestrip_gradient(pts);
+    }
+
+    // Gobo projector: a coloured ring on the back wall when lit.
+    if let Some(Some(proj)) = fx.projectors.first() {
+        if proj.state > 0 {
+            let center = Vec3::new(0.0, 4.0, -3.95);
+            let color = gobo_color(proj.colour);
+            let ring = (0..=24).map(|i| {
+                let a = i as f32 / 24.0 * std::f32::consts::TAU;
+                center + Vec3::new(a.cos() * 1.6, a.sin() * 1.6, 0.0)
+            });
+            gizmos.linestrip(ring, color);
+        }
+    }
+
+    // Turrets: a beam from each lit moving head along its pan/tilt direction.
+    for (i, turret) in fx.turrets.iter().enumerate() {
+        if let Some(t) = turret {
+            if t.state > 0 {
+                let base = turret_base(i);
+                let end = base + turret_dir(t.pan, t.tilt) * 6.0;
+                gizmos.line(base, end, Color::srgb(0.6, 0.9, 1.0));
             }
         }
     }

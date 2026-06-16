@@ -1,0 +1,17 @@
+[package]
+name = "show-seeder"
+version = "0.1.0"
+edition = "2021"
+
+# One-shot host tool: parses the legacy rusty-halloween shows and seeds them into
+# SpacetimeDB as read-only "sample" template projects. Native only (uses the
+# blocking client SDK, NOT the browser feature).
+
+[[bin]]
+name = "show-seeder"
+path = "src/main.rs"
+
+[dependencies]
+spacetimedb-sdk = "2.5"
+serde_json = "1"
+anyhow = "1"

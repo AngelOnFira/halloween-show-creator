@@ -80,14 +80,20 @@ pub fn sync_subscriptions(conn: NonSend<ConnResource>, app: Res<AppState>) {
         return;
     }
 
-    // Subscribe to the new project's chunks *before* dropping the old handle
-    // (the SDK prefers subscribe-new-then-unsubscribe-old to avoid row churn).
+    // Subscribe to the new project's heavy/per-project rows *before* dropping
+    // the old handle (the SDK prefers subscribe-new-then-unsubscribe-old to
+    // avoid row churn): the audio chunks plus the rich fixture keyframes
+    // (lasers / gobo projector / turrets), which only matter while the project
+    // is open.
     let new_handle = app.open_project.map(|pid| {
         c.subscription_builder()
-            .on_error(|_, err| log::error!("song_chunk subscription error: {err}"))
-            .subscribe(vec![format!(
-                "SELECT * FROM song_chunk WHERE project_id = {pid}"
-            )])
+            .on_error(|_, err| log::error!("project-scoped subscription error: {err}"))
+            .subscribe(vec![
+                format!("SELECT * FROM song_chunk WHERE project_id = {pid}"),
+                format!("SELECT * FROM laser_kf WHERE project_id = {pid}"),
+                format!("SELECT * FROM projector_kf WHERE project_id = {pid}"),
+                format!("SELECT * FROM turret_kf WHERE project_id = {pid}"),
+            ])
     });
     if let Some(old) = subs.chunk_handle.take() {
         let _ = old.unsubscribe();

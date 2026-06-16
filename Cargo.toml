@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-exclude = ["spacetimedb"]
+exclude = ["spacetimedb", "tools/show-seeder"]
 
 [dependencies]
 # Trimmed Bevy feature set (default features can't resolve on 0.18.1 — the
@@ -15,6 +15,7 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_render",
     "bevy_core_pipeline",
     "bevy_pbr",
+    "bevy_gizmos",
     "bevy_gltf",
     "bevy_scene",
     "bevy_asset",

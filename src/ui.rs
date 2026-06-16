@@ -11,7 +11,9 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::audio::{self, has_playable_audio, AudioPlayback, UploadPhase, UploadState};
 use crate::conn::{ConnResource, ConnState};
-use crate::logic::{expand_held, fold_keyframes, short_id, state_label};
+use crate::logic::{
+    expand_fixture_tracks, expand_held, fold_keyframes, short_id, state_label,
+};
 use crate::module_bindings::*;
 use crate::state::{AppState, Playback};
 use spacetimedb_sdk::{DbContext, Table};
@@ -22,6 +24,91 @@ const COL_KEYFRAME: Color32 = Color32::from_rgb(255, 255, 255);
 const COL_PLAYHEAD: Color32 = Color32::from_rgb(90, 200, 250);
 const COL_BEAT: Color32 = Color32::from_rgb(80, 160, 150);
 const COL_DOWNBEAT: Color32 = Color32::from_rgb(120, 230, 200);
+// "On" colours for the read-only fixture rows (lasers / gobo projector / turrets)
+// shown beneath the light rows in the timeline.
+const COL_LASER: Color32 = Color32::from_rgb(120, 230, 120);
+const COL_PROJ: Color32 = Color32::from_rgb(220, 130, 235);
+const COL_TURRET: Color32 = Color32::from_rgb(120, 180, 250);
+
+/// A read-only timeline row for a non-light fixture channel (laser / projector /
+/// turret): its per-frame held on/off state and the frames carrying a keyframe.
+struct FixtureTrack {
+    label: String,
+    held: Vec<bool>,
+    keyframes: Vec<u32>,
+    on_color: Color32,
+}
+
+/// Build the read-only fixture rows for a project: one per laser / projector /
+/// turret channel that actually has keyframes.
+fn build_fixture_tracks(conn: &DbConnection, project_id: u64, nf: u32) -> Vec<FixtureTrack> {
+    let mut tracks = Vec::new();
+
+    let lasers: Vec<LaserKeyframe> = conn
+        .db()
+        .laser_kf()
+        .iter()
+        .filter(|r| r.project_id == project_id)
+        .collect();
+    for (ch, (held, kfs)) in
+        expand_fixture_tracks(&lasers, 5, nf, |r| r.channel, |r| r.frame, |r| {
+            r.enable && !r.points.is_empty()
+        })
+        .into_iter()
+        .enumerate()
+    {
+        if !kfs.is_empty() {
+            tracks.push(FixtureTrack {
+                label: format!("La{ch}"),
+                held,
+                keyframes: kfs,
+                on_color: COL_LASER,
+            });
+        }
+    }
+
+    let projectors: Vec<ProjectorKeyframe> = conn
+        .db()
+        .projector_kf()
+        .iter()
+        .filter(|r| r.project_id == project_id)
+        .collect();
+    for (held, kfs) in expand_fixture_tracks(&projectors, 1, nf, |r| r.channel, |r| r.frame, |r| {
+        r.state > 0
+    }) {
+        if !kfs.is_empty() {
+            tracks.push(FixtureTrack {
+                label: "Proj".to_string(),
+                held,
+                keyframes: kfs,
+                on_color: COL_PROJ,
+            });
+        }
+    }
+
+    let turrets: Vec<TurretKeyframe> = conn
+        .db()
+        .turret_kf()
+        .iter()
+        .filter(|r| r.project_id == project_id)
+        .collect();
+    for (ch, (held, kfs)) in
+        expand_fixture_tracks(&turrets, 4, nf, |r| r.channel, |r| r.frame, |r| r.state > 0)
+            .into_iter()
+            .enumerate()
+    {
+        if !kfs.is_empty() {
+            tracks.push(FixtureTrack {
+                label: format!("Tu{ch}"),
+                held,
+                keyframes: kfs,
+                on_color: COL_TURRET,
+            });
+        }
+    }
+
+    tracks
+}
 
 /// The single egui system (runs in `EguiPrimaryContextPass`).
 pub fn ui_system(
@@ -66,11 +153,13 @@ fn ui_connected(
 ) {
     let me = conn.try_identity();
 
+    // Show the user's own projects *and* every seeded sample show (templates are
+    // owned by the seeder but visible to everyone, read-only until forked).
     let mut projects: Vec<Project> = conn
         .db()
         .project()
         .iter()
-        .filter(|p| me.as_ref() == Some(&p.owner))
+        .filter(|p| me.as_ref() == Some(&p.owner) || p.is_template)
         .collect();
     projects.sort_by_key(|p| p.id);
 
@@ -96,10 +185,14 @@ fn ui_connected(
         .and_then(|pid| projects.iter().find(|p| p.id == pid).cloned());
 
     match open {
-        Some(project) => editor_ui(ctx, conn, app, playback, &project, upload, audio),
+        Some(project) => {
+            // Templates the user doesn't own are read-only until forked.
+            let read_only = project.is_template && me.as_ref() != Some(&project.owner);
+            editor_ui(ctx, conn, app, playback, &project, upload, audio, read_only);
+        }
         None => {
             app.open_project = None;
-            project_list_ui(ctx, app, &projects, upload);
+            project_list_ui(ctx, app, &projects, me.as_ref(), upload);
         }
     }
 }
@@ -108,6 +201,7 @@ fn project_list_ui(
     ctx: &egui::Context,
     app: &mut AppState,
     projects: &[Project],
+    me: Option<&spacetimedb_sdk::Identity>,
     upload: &UploadState,
 ) {
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -156,31 +250,66 @@ fn project_list_ui(
             }
         });
 
+        let mine: Vec<&Project> = projects
+            .iter()
+            .filter(|p| !p.is_template && me == Some(&p.owner))
+            .collect();
+        let samples: Vec<&Project> = projects.iter().filter(|p| p.is_template).collect();
+
         ui.add_space(12.0);
         ui.label(egui::RichText::new("Your light shows").strong());
         ui.separator();
-
-        if projects.is_empty() {
+        if mine.is_empty() {
             ui.weak("None yet — create one above.");
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for p in projects {
-                ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() {
-                        app.open_project = Some(p.id);
-                        app.current_frame = 0;
-                        app.history_pos = None;
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .id_salt("my_shows")
+            .show(ui, |ui| {
+                for p in &mine {
+                    ui.horizontal(|ui| {
+                        if ui.button("Open").clicked() {
+                            app.open_project = Some(p.id);
+                            app.current_frame = 0;
+                            app.history_pos = None;
+                        }
+                        ui.label(egui::RichText::new(&p.name).strong());
+                        ui.weak(format!(
+                            "{} lights · {} beats · {} edits",
+                            p.num_lights,
+                            p.num_frames / 2,
+                            p.head_seq
+                        ));
+                    });
+                }
+            });
+
+        if !samples.is_empty() {
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Sample shows").strong());
+            ui.weak("Classic shows imported from the previous software — open to watch, or duplicate to edit your own copy.");
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .id_salt("sample_shows")
+                .show(ui, |ui| {
+                    for p in &samples {
+                        ui.horizontal(|ui| {
+                            if ui.button("Open").clicked() {
+                                app.open_project = Some(p.id);
+                                app.current_frame = 0;
+                                app.history_pos = None;
+                            }
+                            ui.label(egui::RichText::new(&p.name).strong());
+                            ui.weak(format!(
+                                "{} lights · {} beats",
+                                p.num_lights,
+                                p.num_frames / 2
+                            ));
+                        });
                     }
-                    ui.label(egui::RichText::new(&p.name).strong());
-                    ui.weak(format!(
-                        "{} lights · {} beats · {} edits",
-                        p.num_lights,
-                        p.num_frames / 2,
-                        p.head_seq
-                    ));
                 });
-            }
-        });
+        }
 
         if let Some(e) = &app.last_error {
             ui.add_space(8.0);
@@ -189,6 +318,7 @@ fn project_list_ui(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn editor_ui(
     ctx: &egui::Context,
     conn: &DbConnection,
@@ -197,6 +327,7 @@ fn editor_ui(
     project: &Project,
     upload: &UploadState,
     audio: &AudioPlayback,
+    read_only: bool,
 ) {
     let nl = project.num_lights;
     let nf = project.num_frames;
@@ -215,9 +346,13 @@ fn editor_ui(
     let head = project.head_seq;
     let cutoff = app.history_pos.unwrap_or(head).min(head);
     let viewing_history = app.history_pos.is_some_and(|p| p < head);
+    // No edits allowed when time-travelling *or* viewing a read-only sample.
+    let locked = viewing_history || read_only;
 
     let keyframes = fold_keyframes(&edits, cutoff);
     let held = expand_held(&keyframes, nl, nf);
+    // Read-only rows for the rich fixtures (lasers / gobo projector / turrets).
+    let fixture_tracks = build_fixture_tracks(conn, project.id, nf);
 
     // The project's song (may still be uploading). Beats/markers come from the
     // stored on-beat frame list; playback needs a decoded buffer (`audio_ready`).
@@ -252,6 +387,25 @@ fn editor_ui(
                         );
                     } else {
                         ui.weak("(uploading…)");
+                    }
+                }
+            }
+            if read_only {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(240, 200, 80), "sample · read-only");
+                if ui
+                    .button("⧉ Duplicate to my projects")
+                    .on_hover_text("Make an editable copy of this show that you own")
+                    .clicked()
+                {
+                    if let Err(e) = conn.reducers().fork_project(project.id) {
+                        app.last_error = Some(format!("{e}"));
+                    } else {
+                        // Return to the picker; the new copy appears under "Your
+                        // light shows" once the insert replicates.
+                        app.open_project = None;
+                        app.history_pos = None;
+                        app.last_error = None;
                     }
                 }
             }
@@ -298,7 +452,7 @@ fn editor_ui(
                 if on {
                     btn = btn.fill(COL_ON);
                 }
-                if ui.add(btn).clicked() && !viewing_history {
+                if ui.add(btn).clicked() && !locked {
                     let new_state = if on { 0u8 } else { 1u8 };
                     send_edit(conn, app, project.id, l, cf, new_state);
                 }
@@ -316,8 +470,7 @@ fn editor_ui(
                         ui.selectable_value(&mut app.autogen_pattern, 1, pattern_label(1));
                         ui.selectable_value(&mut app.autogen_pattern, 2, pattern_label(2));
                     });
-                let gen =
-                    ui.add_enabled(!viewing_history, egui::Button::new("✨ Generate on beats"));
+                let gen = ui.add_enabled(!locked, egui::Button::new("✨ Generate on beats"));
                 if gen.clicked() {
                     let pat = app.autogen_pattern;
                     autogen_on_beats(conn, app, project, &beats, pat);
@@ -391,8 +544,19 @@ fn editor_ui(
         .resizable(true)
         .default_height(230.0)
         .show(ctx, |ui| {
-            ui.weak("Each column is a half-beat — teal lines mark the beat (the column after each line is the off-beat). Click a cell to cycle none → on → off.");
-            draw_frame_grid(ui, conn, app, playback, project, &held, &keyframes, &beats, viewing_history);
+            ui.weak("Each column is a half-beat — teal lines mark the beat (the column after each line is the off-beat). Click a light cell to cycle none → on → off. Coloured rows below the lights (La/Proj/Tu) show the laser, gobo-projector and turret activity (read-only).");
+            draw_frame_grid(
+                ui,
+                conn,
+                app,
+                playback,
+                project,
+                &held,
+                &keyframes,
+                &fixture_tracks,
+                &beats,
+                locked,
+            );
             if let Some(e) = &app.last_error {
                 ui.add_space(6.0);
                 ui.colored_label(Color32::LIGHT_RED, e);
@@ -410,14 +574,16 @@ fn draw_frame_grid(
     project: &Project,
     held: &[Vec<bool>],
     keyframes: &HashMap<(u32, u32), bool>,
+    fixtures: &[FixtureTrack],
     beats: &[u32],
-    viewing_history: bool,
+    locked: bool,
 ) {
     let nl = project.num_lights;
     let nf = project.num_frames;
+    let nrows = nl + fixtures.len() as u32;
     let cell = Vec2::new(16.0, 18.0);
     let label_w = 42.0_f32;
-    let total = Vec2::new(label_w + nf as f32 * cell.x, nl as f32 * cell.y);
+    let total = Vec2::new(label_w + nf as f32 * cell.x, nrows as f32 * cell.y);
 
     egui::ScrollArea::both().show(ui, |ui| {
         let (rect, resp) = ui.allocate_exact_size(total, Sense::click_and_drag());
@@ -458,6 +624,39 @@ fn draw_frame_grid(
             }
         }
 
+        // Read-only fixture rows (lasers / projector / turrets) beneath lights.
+        if !fixtures.is_empty() {
+            let divider_y = origin.y + nl as f32 * cell.y;
+            painter.hline(
+                rect.x_range(),
+                divider_y,
+                Stroke::new(1.0_f32, Color32::from_gray(70)),
+            );
+        }
+        for (i, tr) in fixtures.iter().enumerate() {
+            let ry = origin.y + (nl + i as u32) as f32 * cell.y;
+            painter.text(
+                Pos2::new(origin.x + 4.0, ry + cell.y * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &tr.label,
+                egui::FontId::monospace(11.0),
+                Color32::GRAY,
+            );
+            for f in 0..nf as usize {
+                let cmin = Pos2::new(origin.x + label_w + f as f32 * cell.x, ry);
+                let crect = Rect::from_min_size(cmin, cell - Vec2::splat(1.0));
+                let on = tr.held.get(f).copied().unwrap_or(false);
+                painter.rect_filled(crect, 2.0_f32, if on { tr.on_color } else { COL_OFF });
+            }
+            for &kf in &tr.keyframes {
+                if (kf as usize) < nf as usize {
+                    let cmin = Pos2::new(origin.x + label_w + kf as f32 * cell.x, ry);
+                    let crect = Rect::from_min_size(cmin, cell - Vec2::splat(1.0));
+                    painter.circle_filled(crect.center(), 2.0, COL_KEYFRAME);
+                }
+            }
+        }
+
         // Beat markers (thin vertical lines; downbeats brighter).
         for (i, &bf) in beats.iter().enumerate() {
             if bf < nf {
@@ -470,7 +669,7 @@ fn draw_frame_grid(
         let px = origin.x + label_w + app.current_frame as f32 * cell.x + cell.x * 0.5;
         painter.vline(px, rect.y_range(), Stroke::new(2.0_f32, COL_PLAYHEAD));
 
-        if resp.clicked() && !viewing_history {
+        if resp.clicked() && !locked {
             if let Some(p) = resp.interact_pointer_pos() {
                 let lx = p.x - origin.x;
                 let ly = p.y - origin.y;
