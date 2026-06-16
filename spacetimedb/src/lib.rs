@@ -33,6 +33,11 @@ pub struct Project {
     /// Defaulted so the column can be added to an existing DB without wiping it.
     #[default(false)]
     pub is_template: bool,
+    /// Reusable blueprint snippet (a saved timeline region) rather than a full
+    /// show. Owner-private and hidden from the project picker; its content is
+    /// normalized so its top-left sits at `(light 0, frame 0)`.
+    #[default(false)]
+    pub is_blueprint: bool,
 }
 
 /// An immutable, append-only edit. The complete history of a project.
@@ -151,6 +156,7 @@ pub fn create_project(
         created_at: ctx.timestamp,
         head_seq: 0,
         is_template: false,
+        is_blueprint: false,
     });
     Ok(())
 }
@@ -196,6 +202,193 @@ pub fn append_edit(
         head_seq: seq,
         ..project
     });
+    Ok(())
+}
+
+/// Resolve a project the caller owns, or an error. Shared by the bulk
+/// paste reducers below (region copy/paste & blueprint insertion).
+fn owned_project(ctx: &ReducerContext, project_id: u64) -> Result<Project, String> {
+    let Some(project) = ctx.db.project().id().find(project_id) else {
+        return Err("Project not found".to_string());
+    };
+    if project.owner != ctx.sender() {
+        return Err("You do not own this project".to_string());
+    }
+    Ok(project)
+}
+
+// ---------------------------------------------------------------------------
+// Region copy/paste: bulk variants of the seed reducers, keyed by `project_id`
+// with an ownership check (the seed reducers are keyed by template name and are
+// host-only). These power the in-editor clipboard (copy a marquee region, then
+// paste / duplicate it) and are reused by blueprint insertion. Lights go
+// through the event-sourced edit log; fixtures are inserted as direct rows.
+// ---------------------------------------------------------------------------
+
+/// Bulk-append light keyframe edits to an owned project, assigning monotonic
+/// `seq` and bumping `head_seq` once (mirrors `append_edit` for many edits).
+#[spacetimedb::reducer]
+pub fn append_edits(
+    ctx: &ReducerContext,
+    project_id: u64,
+    edits: Vec<LightEditInput>,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    let mut seq = project.head_seq;
+    for e in edits {
+        if e.light >= project.num_lights || e.frame >= project.num_frames || e.state > 2 {
+            continue;
+        }
+        seq += 1;
+        ctx.db.edit_log().insert(Edit {
+            id: 0,
+            project_id,
+            seq,
+            author: ctx.sender(),
+            created_at: ctx.timestamp,
+            light: e.light,
+            frame: e.frame,
+            state: e.state,
+        });
+    }
+    ctx.db.project().id().update(Project {
+        head_seq: seq,
+        ..project
+    });
+    Ok(())
+}
+
+/// Paste laser keyframes into an owned project (rows out of frame range are
+/// dropped). Channel is preserved; frames are supplied already offset.
+#[spacetimedb::reducer]
+pub fn paste_laser_keyframes(
+    ctx: &ReducerContext,
+    project_id: u64,
+    rows: Vec<LaserKeyframeInput>,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    for r in rows {
+        if r.frame >= project.num_frames {
+            continue;
+        }
+        ctx.db.laser_kf().insert(LaserKeyframe {
+            id: 0,
+            project_id,
+            frame: r.frame,
+            channel: r.channel,
+            enable: r.enable,
+            pattern: r.pattern,
+            points: r.points,
+        });
+    }
+    Ok(())
+}
+
+/// Paste projector keyframes into an owned project.
+#[spacetimedb::reducer]
+pub fn paste_projector_keyframes(
+    ctx: &ReducerContext,
+    project_id: u64,
+    rows: Vec<ProjectorKeyframeInput>,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    for r in rows {
+        if r.frame >= project.num_frames {
+            continue;
+        }
+        ctx.db.projector_kf().insert(ProjectorKeyframe {
+            id: 0,
+            project_id,
+            frame: r.frame,
+            channel: r.channel,
+            state: r.state,
+            gallery: r.gallery,
+            pattern: r.pattern,
+            colour: r.colour,
+        });
+    }
+    Ok(())
+}
+
+/// Paste turret keyframes into an owned project.
+#[spacetimedb::reducer]
+pub fn paste_turret_keyframes(
+    ctx: &ReducerContext,
+    project_id: u64,
+    rows: Vec<TurretKeyframeInput>,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    for r in rows {
+        if r.frame >= project.num_frames {
+            continue;
+        }
+        ctx.db.turret_kf().insert(TurretKeyframe {
+            id: 0,
+            project_id,
+            frame: r.frame,
+            channel: r.channel,
+            state: r.state,
+            pan: r.pan,
+            tilt: r.tilt,
+        });
+    }
+    Ok(())
+}
+
+/// Delete fixture keyframes in `[f0, f1]` for the listed channels — used by
+/// region delete / move / overwrite. Lights are handled client-side via
+/// `append_edits` (off-keyframes), so they aren't touched here.
+#[spacetimedb::reducer]
+pub fn delete_fixture_region(
+    ctx: &ReducerContext,
+    project_id: u64,
+    f0: u32,
+    f1: u32,
+    laser_channels: Vec<u8>,
+    turret_channels: Vec<u8>,
+    projector: bool,
+) -> Result<(), String> {
+    let _ = owned_project(ctx, project_id)?;
+    let in_range = |f: u32| f >= f0 && f <= f1;
+    if !laser_channels.is_empty() {
+        let ids: Vec<u64> = ctx
+            .db
+            .laser_kf()
+            .project_id()
+            .filter(project_id)
+            .filter(|r| in_range(r.frame) && laser_channels.contains(&r.channel))
+            .map(|r| r.id)
+            .collect();
+        for id in ids {
+            ctx.db.laser_kf().id().delete(id);
+        }
+    }
+    if !turret_channels.is_empty() {
+        let ids: Vec<u64> = ctx
+            .db
+            .turret_kf()
+            .project_id()
+            .filter(project_id)
+            .filter(|r| in_range(r.frame) && turret_channels.contains(&r.channel))
+            .map(|r| r.id)
+            .collect();
+        for id in ids {
+            ctx.db.turret_kf().id().delete(id);
+        }
+    }
+    if projector {
+        let ids: Vec<u64> = ctx
+            .db
+            .projector_kf()
+            .project_id()
+            .filter(project_id)
+            .filter(|r| in_range(r.frame))
+            .map(|r| r.id)
+            .collect();
+        for id in ids {
+            ctx.db.projector_kf().id().delete(id);
+        }
+    }
     Ok(())
 }
 
@@ -508,6 +701,7 @@ pub fn seed_project(
         created_at: ctx.timestamp,
         head_seq: 0,
         is_template: true,
+        is_blueprint: false,
     });
     Ok(())
 }
@@ -778,6 +972,7 @@ pub fn fork_project(ctx: &ReducerContext, project_id: u64) -> Result<(), String>
         created_at: ctx.timestamp,
         head_seq: src.head_seq,
         is_template: false,
+        is_blueprint: false,
     });
     let nid = new.id;
 
@@ -863,5 +1058,230 @@ pub fn fork_project(ctx: &ReducerContext, project_id: u64) -> Result<(), String>
             });
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Blueprints: reusable timeline-region snippets, stored as owner-private,
+// picker-hidden `Project` rows (`is_blueprint = true`). The content is saved
+// already *normalized* so its top-left sits at `(light 0, frame 0)`; the client
+// bakes in the carried-in "boundary" keyframes so a snippet renders the same
+// wherever it is inserted. Light content rides the event-sourced edit log;
+// fixtures are direct rows keyed by their physical channel.
+// ---------------------------------------------------------------------------
+
+/// Save a marquee region as a named blueprint. The client supplies the same
+/// normalized payload it built for the in-session clipboard.
+#[spacetimedb::reducer]
+pub fn save_blueprint(
+    ctx: &ReducerContext,
+    name: String,
+    num_lights: u32,
+    num_frames: u32,
+    light_edits: Vec<LightEditInput>,
+    lasers: Vec<LaserKeyframeInput>,
+    projectors: Vec<ProjectorKeyframeInput>,
+    turrets: Vec<TurretKeyframeInput>,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Blueprint name cannot be empty".to_string());
+    }
+    let num_lights = num_lights.clamp(1, 512);
+    let num_frames = num_frames.clamp(1, 100_000);
+    let bp = ctx.db.project().insert(Project {
+        id: 0,
+        owner: ctx.sender(),
+        name: name.to_string(),
+        num_lights,
+        num_frames,
+        created_at: ctx.timestamp,
+        head_seq: 0,
+        is_template: false,
+        is_blueprint: true,
+    });
+    let bid = bp.id;
+    let mut seq = 0u64;
+    for e in light_edits {
+        if e.light >= num_lights || e.frame >= num_frames || e.state > 2 {
+            continue;
+        }
+        seq += 1;
+        ctx.db.edit_log().insert(Edit {
+            id: 0,
+            project_id: bid,
+            seq,
+            author: ctx.sender(),
+            created_at: ctx.timestamp,
+            light: e.light,
+            frame: e.frame,
+            state: e.state,
+        });
+    }
+    ctx.db.project().id().update(Project { head_seq: seq, ..bp });
+    for r in lasers {
+        if r.frame >= num_frames {
+            continue;
+        }
+        ctx.db.laser_kf().insert(LaserKeyframe {
+            id: 0,
+            project_id: bid,
+            frame: r.frame,
+            channel: r.channel,
+            enable: r.enable,
+            pattern: r.pattern,
+            points: r.points,
+        });
+    }
+    for r in projectors {
+        if r.frame >= num_frames {
+            continue;
+        }
+        ctx.db.projector_kf().insert(ProjectorKeyframe {
+            id: 0,
+            project_id: bid,
+            frame: r.frame,
+            channel: r.channel,
+            state: r.state,
+            gallery: r.gallery,
+            pattern: r.pattern,
+            colour: r.colour,
+        });
+    }
+    for r in turrets {
+        if r.frame >= num_frames {
+            continue;
+        }
+        ctx.db.turret_kf().insert(TurretKeyframe {
+            id: 0,
+            project_id: bid,
+            frame: r.frame,
+            channel: r.channel,
+            state: r.state,
+            pan: r.pan,
+            tilt: r.tilt,
+        });
+    }
+    Ok(())
+}
+
+/// Insert a saved blueprint into an owned project at `(base_light, base_frame)`.
+/// Runs entirely server-side: a blueprint's fixture rows aren't replicated to
+/// the client unless that blueprint happens to be the open project.
+#[spacetimedb::reducer]
+pub fn insert_blueprint(
+    ctx: &ReducerContext,
+    blueprint_id: u64,
+    target_project_id: u64,
+    base_light: u32,
+    base_frame: u32,
+) -> Result<(), String> {
+    let Some(bp) = ctx.db.project().id().find(blueprint_id) else {
+        return Err("Blueprint not found".to_string());
+    };
+    if !bp.is_blueprint {
+        return Err("Not a blueprint".to_string());
+    }
+    if bp.owner != ctx.sender() {
+        return Err("You do not own this blueprint".to_string());
+    }
+    let target = owned_project(ctx, target_project_id)?;
+    let target_lights = target.num_lights;
+    let target_frames = target.num_frames;
+
+    // Lights: re-emit the blueprint's (already normalized) edits, offset into
+    // place, appending to the target's event-sourced log.
+    let mut edits: Vec<Edit> = ctx.db.edit_log().project_id().filter(blueprint_id).collect();
+    edits.sort_by_key(|e| e.seq);
+    let mut seq = target.head_seq;
+    for e in edits {
+        let light = base_light + e.light;
+        let frame = base_frame + e.frame;
+        if light >= target_lights || frame >= target_frames {
+            continue;
+        }
+        seq += 1;
+        ctx.db.edit_log().insert(Edit {
+            id: 0,
+            project_id: target_project_id,
+            seq,
+            author: ctx.sender(),
+            created_at: ctx.timestamp,
+            light,
+            frame,
+            state: e.state,
+        });
+    }
+    ctx.db.project().id().update(Project { head_seq: seq, ..target });
+
+    // Fixtures: preserve the physical channel, offset only the frame.
+    let lasers: Vec<LaserKeyframe> = ctx.db.laser_kf().project_id().filter(blueprint_id).collect();
+    for r in lasers {
+        let frame = base_frame + r.frame;
+        if frame >= target_frames {
+            continue;
+        }
+        ctx.db.laser_kf().insert(LaserKeyframe {
+            id: 0,
+            project_id: target_project_id,
+            frame,
+            channel: r.channel,
+            enable: r.enable,
+            pattern: r.pattern,
+            points: r.points,
+        });
+    }
+    let projectors: Vec<ProjectorKeyframe> =
+        ctx.db.projector_kf().project_id().filter(blueprint_id).collect();
+    for r in projectors {
+        let frame = base_frame + r.frame;
+        if frame >= target_frames {
+            continue;
+        }
+        ctx.db.projector_kf().insert(ProjectorKeyframe {
+            id: 0,
+            project_id: target_project_id,
+            frame,
+            channel: r.channel,
+            state: r.state,
+            gallery: r.gallery,
+            pattern: r.pattern,
+            colour: r.colour,
+        });
+    }
+    let turrets: Vec<TurretKeyframe> =
+        ctx.db.turret_kf().project_id().filter(blueprint_id).collect();
+    for r in turrets {
+        let frame = base_frame + r.frame;
+        if frame >= target_frames {
+            continue;
+        }
+        ctx.db.turret_kf().insert(TurretKeyframe {
+            id: 0,
+            project_id: target_project_id,
+            frame,
+            channel: r.channel,
+            state: r.state,
+            pan: r.pan,
+            tilt: r.tilt,
+        });
+    }
+    Ok(())
+}
+
+/// Delete a blueprint the caller owns (and all of its content).
+#[spacetimedb::reducer]
+pub fn delete_blueprint(ctx: &ReducerContext, blueprint_id: u64) -> Result<(), String> {
+    let Some(bp) = ctx.db.project().id().find(blueprint_id) else {
+        return Err("Blueprint not found".to_string());
+    };
+    if !bp.is_blueprint {
+        return Err("Not a blueprint".to_string());
+    }
+    if bp.owner != ctx.sender() {
+        return Err("You do not own this blueprint".to_string());
+    }
+    delete_project_children(ctx, blueprint_id);
+    ctx.db.project().id().delete(blueprint_id);
     Ok(())
 }

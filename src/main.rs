@@ -44,6 +44,7 @@ fn main() {
         .init_resource::<HeldGrid>()
         .init_resource::<FixtureGrid>()
         .init_resource::<Playback>()
+        .init_resource::<scene::CameraOrbit>()
         .add_systems(Startup, scene::setup_scene_3d)
         .add_systems(Startup, conn::setup_connection)
         .add_systems(Startup, audio::setup_audio)
@@ -70,6 +71,7 @@ fn main() {
                 .chain(),
         )
         .add_systems(Update, scene::draw_fixtures)
+        .add_systems(Update, (scene::camera_drag, scene::orbit_camera).chain())
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .run();
 }

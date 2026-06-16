@@ -13,10 +13,12 @@
 
 use bevy::asset::LoadState;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
+use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
+use bevy_egui::EguiContexts;
 
 use crate::conn::{ConnResource, ConnState};
-use crate::logic::{expand_held, fold_fixtures, fold_keyframes};
+use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes};
 use crate::module_bindings::*;
 use crate::state::{AppState, FixtureGrid, HeldGrid, Playback};
 use spacetimedb_sdk::{DbContext, Table};
@@ -46,6 +48,39 @@ pub struct GltfScene {
     pub spawned: bool,
 }
 
+/// Marks the orbiting viewport camera so the orbit/drag systems can target it.
+#[derive(Component)]
+pub struct OrbitCamera;
+
+/// Defines an orbit of the camera around `center`. The downward tilt (`pitch`)
+/// is fixed at 45° for the RTS look; `radius` (zoom) and `base_angle` (starting
+/// azimuth) are seeded from the GLB camera node when the scene loads. The
+/// user-controlled azimuth lives in `AppState::camera_angle` (degrees) and is
+/// added to `base_angle` each frame by `orbit_camera`.
+#[derive(Resource)]
+pub struct CameraOrbit {
+    /// Look-at target / orbit center.
+    pub center: Vec3,
+    /// 3D distance from `center` to the camera.
+    pub radius: f32,
+    /// Elevation angle above the horizontal plane (radians).
+    pub pitch: f32,
+    /// Azimuth offset (radians) applied before the user's `camera_angle`.
+    pub base_angle: f32,
+}
+
+impl Default for CameraOrbit {
+    fn default() -> Self {
+        Self {
+            center: Vec3::new(0.0, 0.6, 0.0),
+            radius: 14.0,
+            // 40° elevation for the RTS-style top-down look.
+            pitch: 40.0_f32.to_radians(),
+            base_angle: 0.0,
+        }
+    }
+}
+
 /// Colors / intensity for the on/off look.
 #[derive(Resource)]
 pub struct SceneConfig {
@@ -64,16 +99,16 @@ impl Default for SceneConfig {
     }
 }
 
-/// Startup: camera, key light, ground, and kick off the glTF load.
-pub fn setup_scene_3d(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
-) {
+/// Startup: camera, key light, and kick off the glTF load. The set geometry
+/// (fixtures + house) comes entirely from the Blender scene; the glTF carries no
+/// lights, so we add one directional key light here.
+pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // `orbit_camera` overwrites this transform every frame; the starting values
+    // just give a sensible first frame before the orbit resource is read.
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 3.5, 13.0).looking_at(Vec3::new(0.0, 0.6, 0.0), Vec3::Y),
+        OrbitCamera,
     ));
     commands.spawn((
         DirectionalLight {
@@ -81,18 +116,6 @@ pub fn setup_scene_3d(
             ..default()
         },
         Transform::from_xyz(3.0, 8.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-
-    // Dark ground for context (a thin slab).
-    let ground_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.04, 0.04, 0.06),
-        perceptual_roughness: 0.95,
-        ..default()
-    });
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(22.0, 0.1, 8.0))),
-        MeshMaterial3d(ground_mat),
-        Transform::from_xyz(0.0, -0.25, 0.0),
     ));
 
     commands.insert_resource(GltfScene {
@@ -112,6 +135,7 @@ fn parse_light_index(name: &str) -> Option<u32> {
 pub fn spawn_gltf_fixtures(
     mut commands: Commands,
     mut scene: ResMut<GltfScene>,
+    mut orbit: ResMut<CameraOrbit>,
     asset_server: Res<AssetServer>,
     gltfs: Res<Assets<Gltf>>,
     gltf_meshes: Res<Assets<GltfMesh>>,
@@ -127,6 +151,26 @@ pub fn spawn_gltf_fixtures(
             let Some(gltf) = gltfs.get(&scene.handle) else {
                 return;
             };
+            // Seed the orbit (zoom + starting azimuth) from the Blender camera
+            // node if present — it has no mesh but still appears in `gltf.nodes`
+            // by name with its world transform. Pitch stays fixed at 45°.
+            for node_handle in &gltf.nodes {
+                let Some(node) = gltf_nodes.get(node_handle) else {
+                    continue;
+                };
+                if node.mesh.is_none() && node.name.starts_with("Camera") {
+                    let d = node.transform.translation - orbit.center;
+                    orbit.radius = d.length();
+                    orbit.base_angle = d.x.atan2(d.z);
+                    info!(
+                        "seeded camera orbit from glTF node '{}': radius {:.2}, base_angle {:.1}°",
+                        node.name,
+                        orbit.radius,
+                        orbit.base_angle.to_degrees()
+                    );
+                    break;
+                }
+            }
             // Spawn every mesh node (so the whole Blender scene is visible);
             // nodes named `Light.<n>` become toggleable fixtures, everything
             // else is static set geometry. (Assumes a flat scene hierarchy —
@@ -218,6 +262,52 @@ fn spawn_procedural(
     }
 }
 
+/// Degrees of orbit azimuth per pixel of horizontal mouse drag.
+const DRAG_SENSITIVITY: f32 = 0.3;
+
+/// Position the camera each frame on its orbit: fixed 45° elevation, azimuth =
+/// `base_angle` (from the GLB) + the user-controlled `camera_angle` (degrees).
+pub fn orbit_camera(
+    orbit: Res<CameraOrbit>,
+    app: Res<AppState>,
+    mut q: Query<&mut Transform, With<OrbitCamera>>,
+) {
+    let theta = orbit.base_angle + app.camera_angle.to_radians();
+    let horizontal = orbit.radius * orbit.pitch.cos();
+    let height = orbit.radius * orbit.pitch.sin();
+    let pos = orbit.center
+        + Vec3::new(
+            horizontal * theta.sin(),
+            height,
+            horizontal * theta.cos(),
+        );
+    for mut t in &mut q {
+        *t = Transform::from_translation(pos).looking_at(orbit.center, Vec3::Y);
+    }
+}
+
+/// Click-drag anywhere on the 3D scene (i.e. not over an egui panel) to orbit
+/// the camera, mutating the same `camera_angle` the topbar slider drives.
+pub fn camera_drag(
+    mut contexts: EguiContexts,
+    mouse: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    mut app: ResMut<AppState>,
+) {
+    // Ignore drags that egui is consuming (over a panel/widget).
+    let over_ui = contexts
+        .ctx_mut()
+        .map(|c| c.wants_pointer_input())
+        .unwrap_or(false);
+    if over_ui || !mouse.pressed(MouseButton::Left) {
+        return;
+    }
+    let dx = motion.delta.x;
+    if dx != 0.0 {
+        app.camera_angle = (app.camera_angle - dx * DRAG_SENSITIVITY).rem_euclid(360.0);
+    }
+}
+
 /// Recompute the held on/off grid for the open project (read by the 3D apply
 /// system). Mirrors the inline computation the UI does.
 pub fn recompute_held(conn: NonSend<ConnResource>, app: Res<AppState>, mut grid: ResMut<HeldGrid>) {
@@ -243,7 +333,12 @@ pub fn recompute_held(conn: NonSend<ConnResource>, app: Res<AppState>, mut grid:
     edits.sort_by_key(|e| e.seq);
     let head = project.head_seq;
     let cutoff = app.history_pos.unwrap_or(head).min(head);
-    let kf = fold_keyframes(&edits, cutoff);
+    let viewing_history = app.history_pos.is_some_and(|p| p < head);
+    let mut kf = fold_keyframes(&edits, cutoff);
+    // Mirror the UI's optimistic overlay so the 3D view reacts instantly too.
+    if !viewing_history {
+        apply_pending(&mut kf, &app.pending);
+    }
     grid.held = expand_held(&kf, project.num_lights, project.num_frames);
     grid.keyframes = kf;
     grid.nl = project.num_lights;

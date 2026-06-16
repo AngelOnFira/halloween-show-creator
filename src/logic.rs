@@ -6,7 +6,26 @@ use std::collections::HashMap;
 
 use spacetimedb_sdk::Identity;
 
-use crate::module_bindings::Edit;
+use crate::module_bindings::{Edit, LightEditInput};
+
+/// Apply optimistic (not-yet-acknowledged) light edits on top of a folded
+/// keyframe map, so the UI and 3D view react instantly. `state` matches `Edit`:
+/// 0 = off, 1 = on, 2 = clear.
+pub fn apply_pending(kf: &mut HashMap<(u32, u32), bool>, pending: &[LightEditInput]) {
+    for e in pending {
+        match e.state {
+            0 => {
+                kf.insert((e.light, e.frame), false);
+            }
+            1 => {
+                kf.insert((e.light, e.frame), true);
+            }
+            _ => {
+                kf.remove(&(e.light, e.frame));
+            }
+        }
+    }
+}
 
 /// Fold the append-only edit log (up to `cutoff`) into the set of explicit
 /// keyframes. `true` = on keyframe, `false` = off keyframe, absent = no keyframe.

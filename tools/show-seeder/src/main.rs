@@ -13,7 +13,7 @@
 //! (its folder name); `seed_project` makes re-runs idempotent.
 //!
 //! Usage: `cargo run -- [shows_dir]`
-//!   shows_dir defaults to `rusty-halloween/shows/test` (relative to repo root).
+//!   shows_dir defaults to `rusty-halloween/shows` (relative to repo root).
 
 mod module_bindings;
 
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     let shows_dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rusty-halloween/shows/test"));
+        .unwrap_or_else(|| PathBuf::from("rusty-halloween/shows"));
 
     println!("Reading shows from {}", shows_dir.display());
     let mut shows: Vec<Converted> = Vec::new();

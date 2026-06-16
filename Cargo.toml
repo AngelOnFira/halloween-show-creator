@@ -66,5 +66,12 @@ spacetimedb-sdk = { version = "2.5" }
 opt-level = "s"
 lto = "thin"
 
+# `trunk serve` uses the dev profile. DWARF debug info is the bulk of the wasm
+# size (it bloats the pre-bindgen module to >1GB) and is near-useless in the
+# browser, so drop it: smaller downloads AND faster compiles. The `name`
+# section is kept (we don't `strip`), so panic backtraces stay readable.
+[profile.dev]
+debug = false
+
 [profile.dev.package."*"]
 opt-level = 2

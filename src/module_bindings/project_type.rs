@@ -15,6 +15,7 @@ pub struct Project {
     pub created_at: __sdk::Timestamp,
     pub head_seq: u64,
     pub is_template: bool,
+    pub is_blueprint: bool,
 }
 
 impl __sdk::InModule for Project {
@@ -33,6 +34,7 @@ pub struct ProjectCols {
     pub created_at: __sdk::__query_builder::Col<Project, __sdk::Timestamp>,
     pub head_seq: __sdk::__query_builder::Col<Project, u64>,
     pub is_template: __sdk::__query_builder::Col<Project, bool>,
+    pub is_blueprint: __sdk::__query_builder::Col<Project, bool>,
 }
 
 impl __sdk::__query_builder::HasCols for Project {
@@ -47,6 +49,7 @@ impl __sdk::__query_builder::HasCols for Project {
             created_at: __sdk::__query_builder::Col::new(table_name, "created_at"),
             head_seq: __sdk::__query_builder::Col::new(table_name, "head_seq"),
             is_template: __sdk::__query_builder::Col::new(table_name, "is_template"),
+            is_blueprint: __sdk::__query_builder::Col::new(table_name, "is_blueprint"),
         }
     }
 }

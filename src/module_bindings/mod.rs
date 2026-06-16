@@ -7,23 +7,31 @@
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 pub mod append_edit_reducer;
+pub mod append_edits_reducer;
 pub mod append_song_chunk_reducer;
 pub mod begin_song_upload_reducer;
 pub mod create_project_reducer;
+pub mod delete_blueprint_reducer;
+pub mod delete_fixture_region_reducer;
 pub mod delete_song_reducer;
 pub mod edit_log_table;
 pub mod edit_type;
 pub mod fork_project_reducer;
+pub mod insert_blueprint_reducer;
 pub mod laser_keyframe_input_type;
 pub mod laser_keyframe_type;
 pub mod laser_kf_table;
 pub mod laser_point_type;
 pub mod light_edit_input_type;
+pub mod paste_laser_keyframes_reducer;
+pub mod paste_projector_keyframes_reducer;
+pub mod paste_turret_keyframes_reducer;
 pub mod project_table;
 pub mod project_type;
 pub mod projector_keyframe_input_type;
 pub mod projector_keyframe_type;
 pub mod projector_kf_table;
+pub mod save_blueprint_reducer;
 pub mod seed_laser_keyframes_reducer;
 pub mod seed_light_edits_reducer;
 pub mod seed_project_reducer;
@@ -40,23 +48,31 @@ pub mod turret_keyframe_type;
 pub mod turret_kf_table;
 
 pub use append_edit_reducer::append_edit;
+pub use append_edits_reducer::append_edits;
 pub use append_song_chunk_reducer::append_song_chunk;
 pub use begin_song_upload_reducer::begin_song_upload;
 pub use create_project_reducer::create_project;
+pub use delete_blueprint_reducer::delete_blueprint;
+pub use delete_fixture_region_reducer::delete_fixture_region;
 pub use delete_song_reducer::delete_song;
 pub use edit_log_table::*;
 pub use edit_type::Edit;
 pub use fork_project_reducer::fork_project;
+pub use insert_blueprint_reducer::insert_blueprint;
 pub use laser_keyframe_input_type::LaserKeyframeInput;
 pub use laser_keyframe_type::LaserKeyframe;
 pub use laser_kf_table::*;
 pub use laser_point_type::LaserPoint;
 pub use light_edit_input_type::LightEditInput;
+pub use paste_laser_keyframes_reducer::paste_laser_keyframes;
+pub use paste_projector_keyframes_reducer::paste_projector_keyframes;
+pub use paste_turret_keyframes_reducer::paste_turret_keyframes;
 pub use project_table::*;
 pub use project_type::Project;
 pub use projector_keyframe_input_type::ProjectorKeyframeInput;
 pub use projector_keyframe_type::ProjectorKeyframe;
 pub use projector_kf_table::*;
+pub use save_blueprint_reducer::save_blueprint;
 pub use seed_laser_keyframes_reducer::seed_laser_keyframes;
 pub use seed_light_edits_reducer::seed_light_edits;
 pub use seed_project_reducer::seed_project;
@@ -86,6 +102,10 @@ pub enum Reducer {
         frame: u32,
         state: u8,
     },
+    AppendEdits {
+        project_id: u64,
+        edits: Vec<LightEditInput>,
+    },
     AppendSongChunk {
         song_id: u64,
         idx: u32,
@@ -108,11 +128,49 @@ pub enum Reducer {
         num_lights: u32,
         num_frames: u32,
     },
+    DeleteBlueprint {
+        blueprint_id: u64,
+    },
+    DeleteFixtureRegion {
+        project_id: u64,
+        f_0: u32,
+        f_1: u32,
+        laser_channels: Vec<u8>,
+        turret_channels: Vec<u8>,
+        projector: bool,
+    },
     DeleteSong {
         project_id: u64,
     },
     ForkProject {
         project_id: u64,
+    },
+    InsertBlueprint {
+        blueprint_id: u64,
+        target_project_id: u64,
+        base_light: u32,
+        base_frame: u32,
+    },
+    PasteLaserKeyframes {
+        project_id: u64,
+        rows: Vec<LaserKeyframeInput>,
+    },
+    PasteProjectorKeyframes {
+        project_id: u64,
+        rows: Vec<ProjectorKeyframeInput>,
+    },
+    PasteTurretKeyframes {
+        project_id: u64,
+        rows: Vec<TurretKeyframeInput>,
+    },
+    SaveBlueprint {
+        name: String,
+        num_lights: u32,
+        num_frames: u32,
+        light_edits: Vec<LightEditInput>,
+        lasers: Vec<LaserKeyframeInput>,
+        projectors: Vec<ProjectorKeyframeInput>,
+        turrets: Vec<TurretKeyframeInput>,
     },
     SeedLaserKeyframes {
         name: String,
@@ -162,11 +220,19 @@ impl __sdk::Reducer for Reducer {
     fn reducer_name(&self) -> &'static str {
         match self {
             Reducer::AppendEdit { .. } => "append_edit",
+            Reducer::AppendEdits { .. } => "append_edits",
             Reducer::AppendSongChunk { .. } => "append_song_chunk",
             Reducer::BeginSongUpload { .. } => "begin_song_upload",
             Reducer::CreateProject { .. } => "create_project",
+            Reducer::DeleteBlueprint { .. } => "delete_blueprint",
+            Reducer::DeleteFixtureRegion { .. } => "delete_fixture_region",
             Reducer::DeleteSong { .. } => "delete_song",
             Reducer::ForkProject { .. } => "fork_project",
+            Reducer::InsertBlueprint { .. } => "insert_blueprint",
+            Reducer::PasteLaserKeyframes { .. } => "paste_laser_keyframes",
+            Reducer::PasteProjectorKeyframes { .. } => "paste_projector_keyframes",
+            Reducer::PasteTurretKeyframes { .. } => "paste_turret_keyframes",
+            Reducer::SaveBlueprint { .. } => "save_blueprint",
             Reducer::SeedLaserKeyframes { .. } => "seed_laser_keyframes",
             Reducer::SeedLightEdits { .. } => "seed_light_edits",
             Reducer::SeedProject { .. } => "seed_project",
@@ -191,6 +257,12 @@ impl __sdk::Reducer for Reducer {
                 frame: frame.clone(),
                 state: state.clone(),
             }),
+            Reducer::AppendEdits { project_id, edits } => {
+                __sats::bsatn::to_vec(&append_edits_reducer::AppendEditsArgs {
+                    project_id: project_id.clone(),
+                    edits: edits.clone(),
+                })
+            }
             Reducer::AppendSongChunk { song_id, idx, data } => {
                 __sats::bsatn::to_vec(&append_song_chunk_reducer::AppendSongChunkArgs {
                     song_id: song_id.clone(),
@@ -230,6 +302,26 @@ impl __sdk::Reducer for Reducer {
                 num_lights: num_lights.clone(),
                 num_frames: num_frames.clone(),
             }),
+            Reducer::DeleteBlueprint { blueprint_id } => {
+                __sats::bsatn::to_vec(&delete_blueprint_reducer::DeleteBlueprintArgs {
+                    blueprint_id: blueprint_id.clone(),
+                })
+            }
+            Reducer::DeleteFixtureRegion {
+                project_id,
+                f_0,
+                f_1,
+                laser_channels,
+                turret_channels,
+                projector,
+            } => __sats::bsatn::to_vec(&delete_fixture_region_reducer::DeleteFixtureRegionArgs {
+                project_id: project_id.clone(),
+                f_0: f_0.clone(),
+                f_1: f_1.clone(),
+                laser_channels: laser_channels.clone(),
+                turret_channels: turret_channels.clone(),
+                projector: projector.clone(),
+            }),
             Reducer::DeleteSong { project_id } => {
                 __sats::bsatn::to_vec(&delete_song_reducer::DeleteSongArgs {
                     project_id: project_id.clone(),
@@ -240,6 +332,52 @@ impl __sdk::Reducer for Reducer {
                     project_id: project_id.clone(),
                 })
             }
+            Reducer::InsertBlueprint {
+                blueprint_id,
+                target_project_id,
+                base_light,
+                base_frame,
+            } => __sats::bsatn::to_vec(&insert_blueprint_reducer::InsertBlueprintArgs {
+                blueprint_id: blueprint_id.clone(),
+                target_project_id: target_project_id.clone(),
+                base_light: base_light.clone(),
+                base_frame: base_frame.clone(),
+            }),
+            Reducer::PasteLaserKeyframes { project_id, rows } => {
+                __sats::bsatn::to_vec(&paste_laser_keyframes_reducer::PasteLaserKeyframesArgs {
+                    project_id: project_id.clone(),
+                    rows: rows.clone(),
+                })
+            }
+            Reducer::PasteProjectorKeyframes { project_id, rows } => __sats::bsatn::to_vec(
+                &paste_projector_keyframes_reducer::PasteProjectorKeyframesArgs {
+                    project_id: project_id.clone(),
+                    rows: rows.clone(),
+                },
+            ),
+            Reducer::PasteTurretKeyframes { project_id, rows } => {
+                __sats::bsatn::to_vec(&paste_turret_keyframes_reducer::PasteTurretKeyframesArgs {
+                    project_id: project_id.clone(),
+                    rows: rows.clone(),
+                })
+            }
+            Reducer::SaveBlueprint {
+                name,
+                num_lights,
+                num_frames,
+                light_edits,
+                lasers,
+                projectors,
+                turrets,
+            } => __sats::bsatn::to_vec(&save_blueprint_reducer::SaveBlueprintArgs {
+                name: name.clone(),
+                num_lights: num_lights.clone(),
+                num_frames: num_frames.clone(),
+                light_edits: light_edits.clone(),
+                lasers: lasers.clone(),
+                projectors: projectors.clone(),
+                turrets: turrets.clone(),
+            }),
             Reducer::SeedLaserKeyframes { name, rows } => {
                 __sats::bsatn::to_vec(&seed_laser_keyframes_reducer::SeedLaserKeyframesArgs {
                     name: name.clone(),
