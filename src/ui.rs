@@ -15,7 +15,10 @@ use crate::logic::{
     apply_pending, expand_fixture_tracks, expand_held, fold_keyframes, short_id, state_label,
 };
 use crate::module_bindings::*;
-use crate::state::{AppState, Clipboard, DragKind, GridSelection, Playback, TimelineFilter};
+use crate::state::{
+    AppState, Clipboard, DragKind, FixtureEditor, FixtureKind, GridSelection, PendingFixture,
+    Playback, TimelineFilter,
+};
 use spacetimedb_sdk::{DbContext, Table};
 
 const COL_ON: Color32 = Color32::from_rgb(255, 206, 84);
@@ -40,15 +43,6 @@ struct BlueprintPreview {
     num_frames: u32,
     /// `held[light][frame]` for the blueprint's own (normalized) frames.
     held: Vec<Vec<bool>>,
-}
-
-/// Which rich-fixture table a timeline row belongs to (used to read raw
-/// keyframes back when a region covering this row is copied).
-#[derive(Clone, Copy, PartialEq)]
-enum FixtureKind {
-    Laser,
-    Projector,
-    Turret,
 }
 
 /// A read-only timeline row for a non-light fixture channel (laser / projector /
@@ -76,15 +70,28 @@ const RULER_H: f32 = 16.0;
 /// Build the fixture rows for a project — always all channels, in a fixed order
 /// (lasers, then turrets, then the laser projector) so the row layout is stable
 /// and matches the category filter. Empty channels render as all-off rows.
-fn build_fixture_tracks(conn: &DbConnection, project_id: u64, nf: u32) -> Vec<FixtureTrack> {
+fn build_fixture_tracks(
+    conn: &DbConnection,
+    project_id: u64,
+    nf: u32,
+    pending: &[PendingFixture],
+) -> Vec<FixtureTrack> {
     let mut tracks = Vec::new();
 
-    let lasers: Vec<LaserKeyframe> = conn
+    let mut lasers: Vec<LaserKeyframe> = conn
         .db()
         .laser_kf()
         .iter()
         .filter(|r| r.project_id == project_id)
         .collect();
+    for pf in pending {
+        if let PendingFixture::Laser(p) = pf {
+            if p.project_id == project_id {
+                lasers.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                lasers.push(p.clone());
+            }
+        }
+    }
     for (ch, (held, kfs)) in
         expand_fixture_tracks(&lasers, N_LASER, nf, |r| r.channel, |r| r.frame, |r| {
             r.enable && !r.points.is_empty()
@@ -102,12 +109,20 @@ fn build_fixture_tracks(conn: &DbConnection, project_id: u64, nf: u32) -> Vec<Fi
         });
     }
 
-    let turrets: Vec<TurretKeyframe> = conn
+    let mut turrets: Vec<TurretKeyframe> = conn
         .db()
         .turret_kf()
         .iter()
         .filter(|r| r.project_id == project_id)
         .collect();
+    for pf in pending {
+        if let PendingFixture::Turret(p) = pf {
+            if p.project_id == project_id {
+                turrets.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                turrets.push(p.clone());
+            }
+        }
+    }
     for (ch, (held, kfs)) in
         expand_fixture_tracks(&turrets, N_TURRET, nf, |r| r.channel, |r| r.frame, |r| r.state > 0)
             .into_iter()
@@ -123,12 +138,20 @@ fn build_fixture_tracks(conn: &DbConnection, project_id: u64, nf: u32) -> Vec<Fi
         });
     }
 
-    let projectors: Vec<ProjectorKeyframe> = conn
+    let mut projectors: Vec<ProjectorKeyframe> = conn
         .db()
         .projector_kf()
         .iter()
         .filter(|r| r.project_id == project_id)
         .collect();
+    for pf in pending {
+        if let PendingFixture::Projector(p) = pf {
+            if p.project_id == project_id {
+                projectors.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                projectors.push(p.clone());
+            }
+        }
+    }
     for (held, kfs) in expand_fixture_tracks(&projectors, N_PROJECTOR, nf, |r| r.channel, |r| {
         r.frame
     }, |r| r.state > 0)
@@ -144,6 +167,339 @@ fn build_fixture_tracks(conn: &DbConnection, project_id: u64, nf: u32) -> Vec<Fi
     }
 
     tracks
+}
+
+/// 3-bit (0..=7) channel → 0..=255 for the colour picker.
+fn expand3(c: u8) -> u8 {
+    ((c.min(7) as f32 / 7.0) * 255.0).round() as u8
+}
+/// 0..=255 → 3-bit (0..=7) for storage.
+fn quant3(c: u8) -> u8 {
+    ((c as f32 / 255.0) * 7.0).round() as u8
+}
+
+/// Has the backend echoed a row matching this pending fixture edit? (Compares
+/// the key fields, not `points`, since the server fills those itself.)
+fn fixture_echoed(conn: &DbConnection, project_id: u64, pf: &PendingFixture) -> bool {
+    match pf {
+        PendingFixture::Laser(p) => conn.db().laser_kf().iter().any(|r| {
+            r.project_id == project_id
+                && r.channel == p.channel
+                && r.frame == p.frame
+                && r.enable == p.enable
+                && r.pattern == p.pattern
+                && r.cr == p.cr
+                && r.cg == p.cg
+                && r.cb == p.cb
+        }),
+        PendingFixture::Turret(p) => conn.db().turret_kf().iter().any(|r| {
+            r.project_id == project_id
+                && r.channel == p.channel
+                && r.frame == p.frame
+                && r.state == p.state
+                && r.pan == p.pan
+                && r.tilt == p.tilt
+        }),
+        PendingFixture::Projector(p) => conn.db().projector_kf().iter().any(|r| {
+            r.project_id == project_id
+                && r.channel == p.channel
+                && r.frame == p.frame
+                && r.state == p.state
+                && r.gallery == p.gallery
+                && r.pattern == p.pattern
+                && r.colour == p.colour
+        }),
+    }
+}
+
+/// Drop spliced fixture edits whose matching row has arrived from the backend.
+fn clear_echoed_fixtures(conn: &DbConnection, app: &mut AppState, project_id: u64) {
+    if app.pending_fixtures.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut app.pending_fixtures);
+    app.pending_fixtures = pending
+        .into_iter()
+        .filter(|pf| !fixture_echoed(conn, project_id, pf))
+        .collect();
+}
+
+/// Build a `FixtureEditor` pre-loaded from the keyframe in effect at
+/// `(channel, frame)` for the given fixture (held semantics: latest row ≤ frame).
+fn load_fixture_editor(
+    conn: &DbConnection,
+    project_id: u64,
+    kind: FixtureKind,
+    channel: u8,
+    frame: u32,
+    pos: Pos2,
+) -> FixtureEditor {
+    let mut ed = FixtureEditor {
+        kind,
+        channel,
+        frame,
+        pos: (pos.x, pos.y),
+        laser_enable: true,
+        laser_pattern: 0,
+        laser_color: [255, 255, 255],
+        turret_on: true,
+        turret_pan: 128,
+        turret_tilt: 128,
+        proj_on: true,
+        proj_gallery: 0,
+        proj_pattern: 0,
+        proj_colour: 0,
+    };
+    match kind {
+        FixtureKind::Laser => {
+            if let Some(r) = conn
+                .db()
+                .laser_kf()
+                .iter()
+                .filter(|r| r.project_id == project_id && r.channel == channel && r.frame <= frame)
+                .max_by_key(|r| r.frame)
+            {
+                ed.laser_enable = r.enable;
+                ed.laser_pattern = r.pattern;
+                ed.laser_color = [expand3(r.cr), expand3(r.cg), expand3(r.cb)];
+            }
+        }
+        FixtureKind::Turret => {
+            if let Some(r) = conn
+                .db()
+                .turret_kf()
+                .iter()
+                .filter(|r| r.project_id == project_id && r.channel == channel && r.frame <= frame)
+                .max_by_key(|r| r.frame)
+            {
+                ed.turret_on = r.state > 0;
+                ed.turret_pan = r.pan;
+                ed.turret_tilt = r.tilt;
+            }
+        }
+        FixtureKind::Projector => {
+            if let Some(r) = conn
+                .db()
+                .projector_kf()
+                .iter()
+                .filter(|r| r.project_id == project_id && r.channel == channel && r.frame <= frame)
+                .max_by_key(|r| r.frame)
+            {
+                ed.proj_on = r.state > 0;
+                ed.proj_gallery = r.gallery;
+                ed.proj_pattern = r.pattern;
+                ed.proj_colour = r.colour;
+            }
+        }
+    }
+    ed
+}
+
+/// Send the editor's draft to the backend and splice it in for instant feedback.
+fn apply_fixture_edit(conn: &DbConnection, app: &mut AppState, project_id: u64, ed: &FixtureEditor) {
+    let r = conn.reducers();
+    match ed.kind {
+        FixtureKind::Laser => {
+            let cr = quant3(ed.laser_color[0]);
+            let cg = quant3(ed.laser_color[1]);
+            let cb = quant3(ed.laser_color[2]);
+            if let Err(e) = r.set_laser_keyframe(
+                project_id,
+                ed.frame,
+                ed.channel,
+                ed.laser_enable,
+                ed.laser_pattern,
+                cr,
+                cg,
+                cb,
+            ) {
+                app.last_error = Some(format!("{e}"));
+                return;
+            }
+            let points = crate::patterns::get(ed.laser_pattern)
+                .map(|p| {
+                    p.points
+                        .iter()
+                        .map(|pt| LaserPoint { x: pt.x, y: pt.y, r: cr, g: cg, b: cb })
+                        .collect()
+                })
+                .unwrap_or_default();
+            app.pending_fixtures.push(PendingFixture::Laser(LaserKeyframe {
+                id: 0,
+                project_id,
+                frame: ed.frame,
+                channel: ed.channel,
+                enable: ed.laser_enable,
+                pattern: ed.laser_pattern,
+                cr,
+                cg,
+                cb,
+                points,
+            }));
+        }
+        FixtureKind::Turret => {
+            let state = if ed.turret_on { 255 } else { 0 };
+            if let Err(e) =
+                r.set_turret_keyframe(project_id, ed.frame, ed.channel, state, ed.turret_pan, ed.turret_tilt)
+            {
+                app.last_error = Some(format!("{e}"));
+                return;
+            }
+            app.pending_fixtures.push(PendingFixture::Turret(TurretKeyframe {
+                id: 0,
+                project_id,
+                frame: ed.frame,
+                channel: ed.channel,
+                state,
+                pan: ed.turret_pan,
+                tilt: ed.turret_tilt,
+            }));
+        }
+        FixtureKind::Projector => {
+            let state = if ed.proj_on { 255 } else { 0 };
+            if let Err(e) = r.set_projector_keyframe(
+                project_id,
+                ed.frame,
+                ed.channel,
+                state,
+                ed.proj_gallery,
+                ed.proj_pattern,
+                ed.proj_colour,
+            ) {
+                app.last_error = Some(format!("{e}"));
+                return;
+            }
+            app.pending_fixtures.push(PendingFixture::Projector(ProjectorKeyframe {
+                id: 0,
+                project_id,
+                frame: ed.frame,
+                channel: ed.channel,
+                state,
+                gallery: ed.proj_gallery,
+                pattern: ed.proj_pattern,
+                colour: ed.proj_colour,
+            }));
+        }
+    }
+}
+
+/// The floating right-click fixture editor window (laser / turret / projector).
+fn fixture_editor_window(
+    ctx: &egui::Context,
+    conn: &DbConnection,
+    app: &mut AppState,
+    project_id: u64,
+    locked: bool,
+) {
+    let Some(mut ed) = app.fixture_editor.take() else {
+        return;
+    };
+    let mut open = true;
+    let mut apply = false;
+    let title = match ed.kind {
+        FixtureKind::Laser => format!("Laser {} · beat {}", ed.channel + 1, beat_label(ed.frame)),
+        FixtureKind::Turret => format!("Turret {} · beat {}", ed.channel + 1, beat_label(ed.frame)),
+        FixtureKind::Projector => format!("Laser Projector · beat {}", beat_label(ed.frame)),
+    };
+    egui::Window::new(title)
+        .fixed_pos(egui::pos2(ed.pos.0, ed.pos.1))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| match ed.kind {
+            FixtureKind::Laser => {
+                ui.checkbox(&mut ed.laser_enable, "Enabled");
+                ui.horizontal(|ui| {
+                    ui.label("Colour");
+                    ui.color_edit_button_srgb(&mut ed.laser_color);
+                });
+                let tint = [
+                    quant3(ed.laser_color[0]),
+                    quant3(ed.laser_color[1]),
+                    quant3(ed.laser_color[2]),
+                ];
+                // Live preview.
+                let (prect, _) = ui.allocate_exact_size(egui::vec2(130.0, 130.0), Sense::hover());
+                ui.painter_at(prect).rect_filled(prect, 4.0, COL_OFF);
+                if let Some(pat) = crate::patterns::get(ed.laser_pattern) {
+                    crate::patterns::paint_pattern(
+                        &ui.painter_at(prect),
+                        prect.shrink(8.0),
+                        &pat.points,
+                        Some(tint),
+                    );
+                }
+                ui.label(
+                    crate::patterns::get(ed.laser_pattern)
+                        .map(|p| p.name)
+                        .unwrap_or(""),
+                );
+                // Pattern picker grid.
+                egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for pat in crate::patterns::library() {
+                            let (r, resp) =
+                                ui.allocate_exact_size(egui::vec2(46.0, 46.0), Sense::click());
+                            let selected = ed.laser_pattern == pat.id;
+                            let p = ui.painter_at(r);
+                            p.rect_filled(r, 3.0, if selected { Color32::from_gray(64) } else { COL_OFF });
+                            crate::patterns::paint_pattern(&p, r.shrink(5.0), &pat.points, Some([7, 7, 7]));
+                            if selected {
+                                p.rect_stroke(r, 3.0, Stroke::new(1.5, COL_PLAYHEAD), egui::StrokeKind::Inside);
+                            }
+                            if resp.on_hover_text(pat.name).clicked() {
+                                ed.laser_pattern = pat.id;
+                            }
+                        }
+                    });
+                });
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+            }
+            FixtureKind::Turret => {
+                ui.checkbox(&mut ed.turret_on, "On");
+                ui.label("Aim (drag):");
+                let (r, resp) =
+                    ui.allocate_exact_size(egui::vec2(130.0, 130.0), Sense::click_and_drag());
+                let p = ui.painter_at(r);
+                p.rect_filled(r, 4.0, COL_OFF);
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    if resp.clicked() || resp.dragged() {
+                        ed.turret_pan = (((pos.x - r.min.x) / r.width()).clamp(0.0, 1.0) * 255.0) as u8;
+                        ed.turret_tilt = (((pos.y - r.min.y) / r.height()).clamp(0.0, 1.0) * 255.0) as u8;
+                    }
+                }
+                let tip = egui::pos2(
+                    r.min.x + (ed.turret_pan as f32 / 255.0) * r.width(),
+                    r.min.y + (ed.turret_tilt as f32 / 255.0) * r.height(),
+                );
+                p.line_segment([r.center_top(), tip], Stroke::new(2.0, COL_TURRET));
+                p.circle_filled(tip, 4.0, COL_TURRET);
+                ui.add(egui::Slider::new(&mut ed.turret_pan, 0..=255).text("pan"));
+                ui.add(egui::Slider::new(&mut ed.turret_tilt, 0..=255).text("tilt"));
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+            }
+            FixtureKind::Projector => {
+                ui.checkbox(&mut ed.proj_on, "On");
+                ui.weak("Gobo name list pending — raw DMX bytes for now.");
+                ui.add(egui::Slider::new(&mut ed.proj_gallery, 0..=255).text("gallery"));
+                ui.add(egui::Slider::new(&mut ed.proj_pattern, 0..=255).text("gobo"));
+                ui.add(egui::Slider::new(&mut ed.proj_colour, 0..=255).text("colour"));
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+            }
+        });
+
+    if apply && !locked {
+        apply_fixture_edit(conn, app, project_id, &ed);
+        // leave closed
+    } else if open {
+        app.fixture_editor = Some(ed);
+    }
 }
 
 /// Pick the keyframes of one fixture channel that reproduce a `[f0, f1]` region:
@@ -237,6 +593,9 @@ fn extract_region(
                             channel: r.channel,
                             enable: r.enable,
                             pattern: r.pattern,
+                            cr: r.cr,
+                            cg: r.cg,
+                            cb: r.cb,
                             points: r.points,
                         });
                     }
@@ -683,6 +1042,8 @@ fn editor_ui(
     app.cur_head = head;
     if app.pending_project != project.id {
         app.pending.clear();
+        app.pending_fixtures.clear();
+        app.fixture_editor = None;
         app.pending_project = project.id;
     }
     if !app.pending.is_empty() {
@@ -700,8 +1061,11 @@ fn editor_ui(
         apply_pending(&mut keyframes, &app.pending);
     }
     let held = expand_held(&keyframes, nl, nf);
-    // Read-only rows for the rich fixtures (lasers / gobo projector / turrets).
-    let fixture_tracks = build_fixture_tracks(conn, project.id, nf);
+    // Drop spliced fixture edits once the backend has echoed a matching row.
+    clear_echoed_fixtures(conn, app, project.id);
+    // Fixture rows (lasers / turrets / gobo projector), with any just-edited
+    // keyframe spliced in for instant feedback.
+    let fixture_tracks = build_fixture_tracks(conn, project.id, nf, &app.pending_fixtures);
 
     // Drop a selection left over from a different (or since-shrunk) project so a
     // stale highlight never paints over this grid. The clipboard intentionally
@@ -779,6 +1143,7 @@ fn editor_ui(
         if esc {
             app.ghost = None;
             app.selection = None;
+            app.fixture_editor = None;
         }
     }
 
@@ -1029,11 +1394,13 @@ fn editor_ui(
 
     // ---- Timeline grid (bottom panel; the 3D viewport shows through the
     // uncovered center of the screen) ----
+    // Non-resizable and unsized: the panel shrink-wraps its content, so it is
+    // exactly as tall as the ruler + the currently-visible rows + the controls,
+    // and shortens automatically when the category filter hides rows.
     egui::TopBottomPanel::bottom("timeline")
-        .resizable(true)
-        .default_height(330.0)
+        .resizable(false)
         .show(ctx, |ui| {
-            ui.weak("Drag the top ruler to scrub. On light rows: click toggles a frame (splits a bar), drag paints a bar, drag a bar's edge to resize. Shift+drag selects (Delete clears it); Ctrl+drag copies to a white ghost (click to stamp, right-click/Esc to drop); drag inside a selection to move it.");
+            ui.weak("Ruler = scrub · click/drag light rows to edit bars (drag an edge to resize) · Shift+drag = select (Del clears) · Ctrl+drag = white ghost (click stamps) · drag a selection to move");
 
             // ---- Category filter ----
             ui.horizontal(|ui| {
@@ -1116,6 +1483,9 @@ fn editor_ui(
                 ui.colored_label(Color32::LIGHT_RED, e);
             }
         });
+
+    // Right-click fixture editor (floating window), drawn last so it overlays.
+    fixture_editor_window(ctx, conn, app, project.id, locked);
 }
 
 /// Where a pointer landed on the grid: the beat ruler, a device row, or off-grid.
@@ -1403,6 +1773,9 @@ fn do_move_region(
                     channel: r.channel,
                     enable: r.enable,
                     pattern: r.pattern,
+                    cr: r.cr,
+                    cg: r.cg,
+                    cb: r.cb,
                     points: r.points,
                 });
             }
@@ -1596,10 +1969,6 @@ fn draw_frame_grid(
 
     let scroll_no_drag =
         egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL;
-    egui::ScrollArea::vertical()
-        .id_salt("timeline_rows")
-        .scroll_source(scroll_no_drag)
-        .show(ui, |ui| {
     ui.horizontal_top(|ui| {
         // ---- Sticky label column ----
         let (lrect, _) = ui.allocate_exact_size(Vec2::new(label_w, content_h), Sense::hover());
@@ -1784,7 +2153,20 @@ fn draw_frame_grid(
                 }
             }
             if resp.secondary_clicked() {
-                app.ghost = None;
+                // Right-click drops an in-hand ghost; otherwise it opens the
+                // editor for a fixture row (light rows keep their left-click).
+                if app.ghost.is_some() {
+                    app.ghost = None;
+                } else if !locked {
+                    if let Some(GridHit::Row(c, f)) = resp.interact_pointer_pos().map(at) {
+                        if c >= nl {
+                            let tr = &fixtures[(c - nl) as usize];
+                            let pos = resp.interact_pointer_pos().unwrap_or(origin);
+                            app.fixture_editor =
+                                Some(load_fixture_editor(conn, project.id, tr.kind, tr.channel, f, pos));
+                        }
+                    }
+                }
             }
             if resp.clicked() && !shift && !ctrl {
                 if let Some(p) = resp.interact_pointer_pos() {
@@ -1902,7 +2284,30 @@ fn draw_frame_grid(
                 _ => {}
             }
 
-            // Rows: off background + on-runs as bars.
+            // Governing fixture keyframe at a (channel, frame) — latest row ≤ frame.
+            let laser_at = |channel: u8, frame: u32| -> Option<LaserKeyframe> {
+                conn.db()
+                    .laser_kf()
+                    .iter()
+                    .filter(|r| r.project_id == project.id && r.channel == channel && r.frame <= frame)
+                    .max_by_key(|r| r.frame)
+            };
+            let turret_at = |channel: u8, frame: u32| -> Option<TurretKeyframe> {
+                conn.db()
+                    .turret_kf()
+                    .iter()
+                    .filter(|r| r.project_id == project.id && r.channel == channel && r.frame <= frame)
+                    .max_by_key(|r| r.frame)
+            };
+            let proj_at = |frame: u32| -> Option<ProjectorKeyframe> {
+                conn.db()
+                    .projector_kf()
+                    .iter()
+                    .filter(|r| r.project_id == project.id && r.channel == 0 && r.frame <= frame)
+                    .max_by_key(|r| r.frame)
+            };
+
+            // Rows: off background + on-runs as bars (lasers also show the shape).
             for vi in 0..count {
                 let c = first + vi;
                 let ry = row_top + vi as f32 * cell.y;
@@ -1911,12 +2316,14 @@ fn draw_frame_grid(
                     0.0,
                     COL_OFF,
                 );
+                let kind = (c >= nl).then(|| fixtures[(c - nl) as usize].kind);
                 let (row, color): (&Vec<bool>, Color32) = if c < nl {
                     (override_rows.get(&c).unwrap_or(&held[c as usize]), COL_ON)
                 } else {
                     let tr = &fixtures[(c - nl) as usize];
                     (&tr.held, tr.on_color)
                 };
+                let channel = (c >= nl).then(|| fixtures[(c - nl) as usize].channel).unwrap_or(0);
                 let mut f = 0usize;
                 while f < row.len() {
                     if row[f] {
@@ -1928,21 +2335,108 @@ fn draw_frame_grid(
                             Pos2::new(origin.x + (e + 1) as f32 * cell.x - 1.0, ry + cell.y - 1.0),
                         );
                         painter.rect_filled(brect, 3.0, color);
+                        // Inline laser shape thumbnail (runs wide enough to read).
+                        // Prefer stored points (legacy per-point colours); else
+                        // the library shape tinted by the keyframe colour.
+                        if kind == Some(FixtureKind::Laser) && e - s >= 2 {
+                            if let Some(kf) = laser_at(channel, s as u32) {
+                                if kf.enable {
+                                    if !kf.points.is_empty() {
+                                        let pts: Vec<crate::patterns::PatternPoint> = kf
+                                            .points
+                                            .iter()
+                                            .map(|p| crate::patterns::PatternPoint {
+                                                x: p.x,
+                                                y: p.y,
+                                                r: p.r,
+                                                g: p.g,
+                                                b: p.b,
+                                            })
+                                            .collect();
+                                        crate::patterns::paint_pattern(
+                                            &painter,
+                                            brect.shrink(2.0),
+                                            &pts,
+                                            None,
+                                        );
+                                    } else if let Some(pat) = crate::patterns::get(kf.pattern) {
+                                        crate::patterns::paint_pattern(
+                                            &painter,
+                                            brect.shrink(2.0),
+                                            &pat.points,
+                                            Some([kf.cr, kf.cg, kf.cb]),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         f = e + 1;
                     } else {
                         f += 1;
                     }
                 }
+                // Fixture keyframe markers: turret rows show an aim arrow, others a dot.
                 if c >= nl {
                     for &kf in &fixtures[(c - nl) as usize].keyframes {
-                        if kf < nf {
-                            painter.circle_filled(
-                                Pos2::new(origin.x + kf as f32 * cell.x + cell.x * 0.5, ry + cell.y * 0.5),
-                                1.5,
-                                COL_KEYFRAME,
-                            );
+                        if kf >= nf {
+                            continue;
                         }
+                        let cx = origin.x + kf as f32 * cell.x + cell.x * 0.5;
+                        let cy = ry + cell.y * 0.5;
+                        if kind == Some(FixtureKind::Turret) {
+                            if let Some(t) = turret_at(channel, kf) {
+                                let yaw = (t.pan as f32 / 255.0 - 0.5) * std::f32::consts::PI;
+                                let v = egui::vec2(yaw.sin(), -(1.0 - t.tilt as f32 / 255.0)).normalized()
+                                    * 6.0;
+                                let end = Pos2::new(cx, cy) + v;
+                                painter.line_segment([Pos2::new(cx, cy), end], Stroke::new(1.5, COL_KEYFRAME));
+                                painter.circle_filled(end, 1.5, COL_TURRET);
+                                continue;
+                            }
+                        }
+                        painter.circle_filled(Pos2::new(cx, cy), 1.5, COL_KEYFRAME);
                     }
+                }
+            }
+
+            // Hover tooltip describing the fixture keyframe under the cursor.
+            if let Some(GridHit::Row(c, f)) = resp.hover_pos().map(at) {
+                if c >= nl {
+                    let tr = &fixtures[(c - nl) as usize];
+                    let n = tr.channel + 1;
+                    let text = match tr.kind {
+                        FixtureKind::Laser => match laser_at(tr.channel, f) {
+                            Some(k) if k.enable => format!(
+                                "Laser {n} · {} · rgb {} {} {}",
+                                crate::patterns::get(k.pattern).map(|p| p.name).unwrap_or("?"),
+                                k.cr, k.cg, k.cb
+                            ),
+                            Some(_) => format!("Laser {n} · off"),
+                            None => format!("Laser {n} · —"),
+                        },
+                        FixtureKind::Turret => match turret_at(tr.channel, f) {
+                            Some(t) => format!(
+                                "Turret {n} · pan {}° tilt {}° · {}",
+                                ((t.pan as f32 / 255.0 - 0.5) * 180.0).round() as i32,
+                                (t.tilt as f32 / 255.0 * 90.0).round() as i32,
+                                if t.state > 0 { "on" } else { "off" }
+                            ),
+                            None => format!("Turret {n} · —"),
+                        },
+                        FixtureKind::Projector => match proj_at(f) {
+                            Some(p) => format!(
+                                "Laser Projector · gobo {} · colour {} · {}",
+                                p.pattern,
+                                p.colour,
+                                if p.state > 0 { "on" } else { "off" }
+                            ),
+                            None => "Laser Projector · —".to_string(),
+                        },
+                    };
+                    resp.clone()
+                        .on_hover_ui_at_pointer(|ui| {
+                            ui.label(text);
+                        });
                 }
             }
 
@@ -2000,7 +2494,6 @@ fn draw_frame_grid(
                 draw_selection_overlay(&painter, origin, row_top, cell, first, count, dst, Color32::from_rgba_unmultiplied(245, 245, 245, 25), COL_GHOST_EDGE);
             }
         });
-    });
     });
 }
 

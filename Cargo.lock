@@ -5376,6 +5376,7 @@ dependencies = [
  "log",
  "rfd",
  "rustfft",
+ "serde_json",
  "spacetimedb-sdk",
  "wasm-bindgen",
  "wasm-bindgen-futures",

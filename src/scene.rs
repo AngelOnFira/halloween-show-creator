@@ -20,7 +20,7 @@ use bevy_egui::EguiContexts;
 use crate::conn::{ConnResource, ConnState};
 use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes};
 use crate::module_bindings::*;
-use crate::state::{AppState, FixtureGrid, HeldGrid, Playback};
+use crate::state::{AppState, FixtureGrid, HeldGrid, PendingFixture, Playback};
 use spacetimedb_sdk::{DbContext, Table};
 
 /// Channel counts for the rich fixtures (mirrors the legacy hardware layout).
@@ -433,28 +433,45 @@ pub fn recompute_fixtures(
     };
     let frame = app.current_frame;
 
-    let lasers: Vec<LaserKeyframe> = c
+    // Splice in just-edited (not-yet-echoed) fixture keyframes so the 3D view
+    // reacts instantly, mirroring the timeline's optimistic feedback.
+    let mut lasers: Vec<LaserKeyframe> = c
         .db()
         .laser_kf()
         .iter()
         .filter(|r| r.project_id == pid)
         .collect();
-    fx.lasers = fold_fixtures(&lasers, frame, NUM_LASERS, |r| r.channel, |r| r.frame);
-
-    let projectors: Vec<ProjectorKeyframe> = c
+    let mut projectors: Vec<ProjectorKeyframe> = c
         .db()
         .projector_kf()
         .iter()
         .filter(|r| r.project_id == pid)
         .collect();
-    fx.projectors = fold_fixtures(&projectors, frame, NUM_PROJECTORS, |r| r.channel, |r| r.frame);
-
-    let turrets: Vec<TurretKeyframe> = c
+    let mut turrets: Vec<TurretKeyframe> = c
         .db()
         .turret_kf()
         .iter()
         .filter(|r| r.project_id == pid)
         .collect();
+    for pf in &app.pending_fixtures {
+        match pf {
+            PendingFixture::Laser(p) if p.project_id == pid => {
+                lasers.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                lasers.push(p.clone());
+            }
+            PendingFixture::Turret(p) if p.project_id == pid => {
+                turrets.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                turrets.push(p.clone());
+            }
+            PendingFixture::Projector(p) if p.project_id == pid => {
+                projectors.retain(|r| !(r.channel == p.channel && r.frame == p.frame));
+                projectors.push(p.clone());
+            }
+            _ => {}
+        }
+    }
+    fx.lasers = fold_fixtures(&lasers, frame, NUM_LASERS, |r| r.channel, |r| r.frame);
+    fx.projectors = fold_fixtures(&projectors, frame, NUM_PROJECTORS, |r| r.channel, |r| r.frame);
     fx.turrets = fold_fixtures(&turrets, frame, NUM_TURRETS, |r| r.channel, |r| r.frame);
 }
 
@@ -462,7 +479,8 @@ pub fn recompute_fixtures(
 /// behind the fixtures.
 fn laser_to_world(x: i16, y: i16) -> Vec3 {
     let nx = (x as f32 / 300.0 - 0.5) * 10.0;
-    let ny = 0.5 + (y as f32 / 300.0) * 5.0;
+    // Galvo Y increases downward, so invert it for world-up.
+    let ny = 5.5 - (y as f32 / 300.0) * 5.0;
     Vec3::new(nx, ny, -4.0)
 }
 
@@ -495,16 +513,41 @@ pub fn draw_fixtures(app: Res<AppState>, fx: Res<FixtureGrid>, mut gizmos: Gizmo
         return;
     }
 
-    // Lasers: each active laser draws its path as a colour-graded line strip.
+    // Lasers: draw each lit segment of the shape, honouring beam blanking and
+    // the closed-loop return (see `patterns::outline_segments`). Prefer the
+    // stored points (legacy per-point colour); otherwise the library shape by
+    // id, tinted by the keyframe colour.
     for laser in fx.lasers.iter().flatten() {
-        if !laser.enable || laser.points.len() < 2 {
+        if !laser.enable {
             continue;
         }
-        let pts = laser
-            .points
-            .iter()
-            .map(|p| (laser_to_world(p.x, p.y), laser_color(p.r, p.g, p.b)));
-        gizmos.linestrip_gradient(pts);
+        let (pts, tint): (Vec<crate::patterns::PatternPoint>, Option<(u8, u8, u8)>) =
+            if laser.points.len() >= 2 {
+                let v = laser
+                    .points
+                    .iter()
+                    .map(|p| crate::patterns::PatternPoint {
+                        x: p.x,
+                        y: p.y,
+                        r: p.r,
+                        g: p.g,
+                        b: p.b,
+                    })
+                    .collect();
+                (v, None)
+            } else if let Some(pat) = crate::patterns::get(laser.pattern) {
+                (pat.points.clone(), Some((laser.cr, laser.cg, laser.cb)))
+            } else {
+                continue;
+            };
+        for (src, dst) in crate::patterns::outline_segments(&pts) {
+            let (r, g, b) = tint.unwrap_or((src.r, src.g, src.b));
+            gizmos.line(
+                laser_to_world(src.x, src.y),
+                laser_to_world(dst.x, dst.y),
+                laser_color(r, g, b),
+            );
+        }
     }
 
     // Gobo projector: a coloured ring on the back wall when lit.
@@ -520,13 +563,20 @@ pub fn draw_fixtures(app: Res<AppState>, fx: Res<FixtureGrid>, mut gizmos: Gizmo
         }
     }
 
-    // Turrets: a beam from each lit moving head along its pan/tilt direction.
+    // Turrets: a base marker plus a beam that fades from the head outward.
     for (i, turret) in fx.turrets.iter().enumerate() {
         if let Some(t) = turret {
             if t.state > 0 {
                 let base = turret_base(i);
                 let end = base + turret_dir(t.pan, t.tilt) * 6.0;
-                gizmos.line(base, end, Color::srgb(0.6, 0.9, 1.0));
+                let near = Color::srgb(0.75, 0.95, 1.0);
+                let far = Color::srgba(0.3, 0.6, 0.9, 0.12);
+                gizmos.linestrip_gradient([(base, near), (end, far)]);
+                // Small cross marking the fixed mount position.
+                let s = 0.18;
+                let m = Color::srgb(0.5, 0.8, 1.0);
+                gizmos.line(base - Vec3::X * s, base + Vec3::X * s, m);
+                gizmos.line(base - Vec3::Z * s, base + Vec3::Z * s, m);
             }
         }
     }

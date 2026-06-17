@@ -30,6 +30,8 @@ bevy_egui = "0.39"
 log = "0.4"
 # Pure-Rust FFT for the spectral-flux beat detector (wasm-compatible).
 rustfft = "6"
+# Parse the embedded laser pattern library (assets/patterns.json).
+serde_json = "1"
 
 # Browser (wasm) build: the SpacetimeDB Rust SDK only works in the browser with
 # its `browser` feature. The connection is driven by `frame_tick()` in a Bevy

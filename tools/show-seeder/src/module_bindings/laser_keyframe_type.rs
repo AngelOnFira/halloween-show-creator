@@ -16,6 +16,9 @@ pub struct LaserKeyframe {
     pub enable: bool,
     pub pattern: u8,
     pub points: Vec<LaserPoint>,
+    pub cr: u8,
+    pub cg: u8,
+    pub cb: u8,
 }
 
 impl __sdk::InModule for LaserKeyframe {
@@ -33,6 +36,9 @@ pub struct LaserKeyframeCols {
     pub enable: __sdk::__query_builder::Col<LaserKeyframe, bool>,
     pub pattern: __sdk::__query_builder::Col<LaserKeyframe, u8>,
     pub points: __sdk::__query_builder::Col<LaserKeyframe, Vec<LaserPoint>>,
+    pub cr: __sdk::__query_builder::Col<LaserKeyframe, u8>,
+    pub cg: __sdk::__query_builder::Col<LaserKeyframe, u8>,
+    pub cb: __sdk::__query_builder::Col<LaserKeyframe, u8>,
 }
 
 impl __sdk::__query_builder::HasCols for LaserKeyframe {
@@ -46,6 +52,9 @@ impl __sdk::__query_builder::HasCols for LaserKeyframe {
             enable: __sdk::__query_builder::Col::new(table_name, "enable"),
             pattern: __sdk::__query_builder::Col::new(table_name, "pattern"),
             points: __sdk::__query_builder::Col::new(table_name, "points"),
+            cr: __sdk::__query_builder::Col::new(table_name, "cr"),
+            cg: __sdk::__query_builder::Col::new(table_name, "cg"),
+            cb: __sdk::__query_builder::Col::new(table_name, "cb"),
         }
     }
 }

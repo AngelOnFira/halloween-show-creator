@@ -13,6 +13,9 @@ pub struct LaserKeyframeInput {
     pub channel: u8,
     pub enable: bool,
     pub pattern: u8,
+    pub cr: u8,
+    pub cg: u8,
+    pub cb: u8,
     pub points: Vec<LaserPoint>,
 }
 

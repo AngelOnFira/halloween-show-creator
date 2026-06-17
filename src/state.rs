@@ -10,6 +10,45 @@ use crate::module_bindings::{
     TurretKeyframe, TurretKeyframeInput,
 };
 
+/// Which rich-fixture family a timeline row / editor refers to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FixtureKind {
+    Laser,
+    Projector,
+    Turret,
+}
+
+/// State of the open right-click fixture editor (a floating egui window). Draft
+/// values are pre-loaded from the keyframe in effect at `(channel, frame)` and
+/// written back on Apply. Laser colour is held as 0..=255 for a nice picker and
+/// quantized to 3-bit only when sent.
+pub struct FixtureEditor {
+    pub kind: FixtureKind,
+    pub channel: u8,
+    pub frame: u32,
+    pub pos: (f32, f32),
+    pub laser_enable: bool,
+    pub laser_pattern: u8,
+    pub laser_color: [u8; 3],
+    pub turret_on: bool,
+    pub turret_pan: u8,
+    pub turret_tilt: u8,
+    pub proj_on: bool,
+    pub proj_gallery: u8,
+    pub proj_pattern: u8,
+    pub proj_colour: u8,
+}
+
+/// A fixture keyframe just sent to the backend, spliced into the folded state
+/// until it echoes back so the just-edited cell updates instantly (fixtures
+/// aren't event-sourced, so they lack the lights' prediction overlay).
+#[derive(Clone)]
+pub enum PendingFixture {
+    Laser(LaserKeyframe),
+    Turret(TurretKeyframe),
+    Projector(ProjectorKeyframe),
+}
+
 /// Which device category the timeline shows. `All` stacks every device row;
 /// the others narrow to a single category.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -78,6 +117,9 @@ impl Clipboard {
                 channel: r.channel,
                 enable: r.enable,
                 pattern: r.pattern,
+                cr: r.cr,
+                cg: r.cg,
+                cb: r.cb,
                 points: r.points.clone(),
             })
             .collect()
@@ -212,6 +254,10 @@ pub struct AppState {
     pub pending_project: u64,
     /// Cached `head_seq` of the open project (set each frame by the UI).
     pub cur_head: u64,
+    /// Open right-click fixture editor, if any.
+    pub fixture_editor: Option<FixtureEditor>,
+    /// Just-sent fixture keyframes, spliced in until the backend echoes them.
+    pub pending_fixtures: Vec<PendingFixture>,
 }
 
 impl Default for AppState {
@@ -237,6 +283,8 @@ impl Default for AppState {
             pending_base: 0,
             pending_project: 0,
             cur_head: 0,
+            fixture_editor: None,
+            pending_fixtures: Vec::new(),
         }
     }
 }

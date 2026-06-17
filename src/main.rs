@@ -7,6 +7,7 @@ mod audio;
 mod conn;
 mod logic;
 mod module_bindings;
+mod patterns;
 mod scene;
 mod state;
 mod ui;

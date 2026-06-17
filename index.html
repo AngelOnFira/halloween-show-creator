@@ -16,6 +16,16 @@
         html, body { overflow: hidden; margin: 0; padding: 0; height: 100%; width: 100%; background: #0e0e12; }
         canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
     </style>
+
+    <script>
+        // Bevy/winit calls preventDefault() on key events, which swallows Ctrl+R.
+        // Capture-phase listener runs first so the browser reload still happens.
+        window.addEventListener('keydown', (e) => {
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R')) {
+                window.location.reload();
+            }
+        }, true);
+    </script>
 </head>
 <body>
     <canvas id="the_canvas_id"></canvas>

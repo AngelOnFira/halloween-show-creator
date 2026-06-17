@@ -122,6 +122,8 @@ fn connect(shared: Rc<RefCell<ConnState>>) {
                         "SELECT * FROM project".to_string(),
                         "SELECT * FROM edit_log".to_string(),
                         "SELECT * FROM song".to_string(),
+                        // The laser pattern library: global reference data.
+                        "SELECT * FROM pattern".to_string(),
                     ]);
             })
             .on_connect_error(|_ctx, err| log::error!("connect error: {err}"));

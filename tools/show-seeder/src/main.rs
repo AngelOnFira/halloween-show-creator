@@ -132,6 +132,8 @@ fn main() -> Result<()> {
     println!("\nConnecting to {DB_NAME} at {HOST} …");
     let conn = connect()?;
 
+    seed_patterns(&conn)?;
+
     for show in &shows {
         seed_show(&conn, show)?;
     }
@@ -264,6 +266,9 @@ fn parse_laser(frame: u32, channel: u8, val: &Value) -> Option<LaserKeyframeInpu
             channel,
             enable: false,
             pattern: 0,
+            cr: 7,
+            cg: 7,
+            cb: 7,
             points: Vec::new(),
         });
     }
@@ -296,13 +301,61 @@ fn parse_laser(frame: u32, channel: u8, val: &Value) -> Option<LaserKeyframeInpu
         .and_then(|name| LASER_PATTERNS.iter().position(|&p| p == name))
         .unwrap_or(0) as u8;
 
+    // Backfill a single tint from the first non-black point (clamped to 3-bit).
+    let (cr, cg, cb) = points
+        .iter()
+        .find(|p| p.r != 0 || p.g != 0 || p.b != 0)
+        .map(|p| (p.r.min(7), p.g.min(7), p.b.min(7)))
+        .unwrap_or((7, 7, 7));
+
     Some(LaserKeyframeInput {
         frame,
         channel,
         enable: true,
         pattern,
+        cr,
+        cg,
+        cb,
         points,
     })
+}
+
+/// Seed the shared laser pattern library from the legacy `patterns.json` so the
+/// DB (and any downloaded show) carries the geometry the lasers reference.
+fn seed_patterns(conn: &DbConnection) -> Result<()> {
+    let path = Path::new("rusty-halloween/config/patterns.json");
+    let json = read_json(path)?;
+    let obj = json.as_object().context("patterns.json is not an object")?;
+    println!("\nSeeding {} patterns …", LASER_PATTERNS.len());
+    for (id, &name) in LASER_PATTERNS.iter().enumerate() {
+        let points: Vec<LaserPoint> = obj
+            .get(name)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| {
+                        let v = u32::from_str_radix(h.as_str()?.trim_start_matches("0x"), 16).ok()?;
+                        if v == 0 {
+                            return None;
+                        }
+                        Some(LaserPoint {
+                            x: ((v & 0xFF80_0000) >> 23) as i16,
+                            y: ((v & 0x007F_C000) >> 14) as i16,
+                            r: ((v & 0x0000_3800) >> 11) as u8,
+                            g: ((v & 0x0000_0700) >> 8) as u8,
+                            b: ((v & 0x0000_00E0) >> 5) as u8,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let nm = name.to_string();
+        await_reducer("seed_pattern", |tx| {
+            conn.reducers()
+                .seed_pattern_then(id as u8, nm.clone(), points.clone(), reducer_cb(tx))
+        })?;
+    }
+    Ok(())
 }
 
 fn u8field(val: &Value, key: &str) -> u8 {

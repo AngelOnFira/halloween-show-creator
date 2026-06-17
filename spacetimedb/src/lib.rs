@@ -92,9 +92,19 @@ pub struct LaserKeyframe {
     pub channel: u8,
     /// False = laser blanked at this keyframe (an off/reset keyframe).
     pub enable: bool,
-    /// Legacy pattern id (0..=38); informational — `points` carry the geometry.
+    /// Pattern id = index into the shared pattern library (see `Pattern`).
     pub pattern: u8,
     pub points: Vec<LaserPoint>,
+    /// Single 3-bit (0..=7) per-channel tint for the whole shape. Appended last
+    /// and defaulted so the columns can be added to an existing DB without a
+    /// manual migration; legacy rows keep their per-point colours in `points`
+    /// (which render takes first).
+    #[default(7)]
+    pub cr: u8,
+    #[default(7)]
+    pub cg: u8,
+    #[default(7)]
+    pub cb: u8,
 }
 
 /// A DMX gobo projector's state at a frame. `channel` 0 (one projector, `lp-1`).
@@ -128,6 +138,18 @@ pub struct TurretKeyframe {
     pub state: u8,
     pub pan: u8,
     pub tilt: u8,
+}
+
+/// The shared laser pattern library: the fixed set of vector shapes a laser can
+/// draw. Global reference data (not per-project), seeded once from the legacy
+/// `patterns.json`. `id` is the index used by `LaserKeyframe.pattern`. Stored in
+/// the DB so a downloaded show embeds the geometry it references.
+#[spacetimedb::table(accessor = pattern, public)]
+pub struct Pattern {
+    #[primary_key]
+    pub id: u8,
+    pub name: String,
+    pub points: Vec<LaserPoint>,
 }
 
 #[spacetimedb::reducer(init)]
@@ -278,6 +300,9 @@ pub fn paste_laser_keyframes(
             channel: r.channel,
             enable: r.enable,
             pattern: r.pattern,
+            cr: r.cr,
+            cg: r.cg,
+            cb: r.cb,
             points: r.points,
         });
     }
@@ -389,6 +414,171 @@ pub fn delete_fixture_region(
             ctx.db.projector_kf().id().delete(id);
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-keyframe fixture editing: upsert a single fixture keyframe (replacing any
+// existing one at the same channel + frame). Used by the right-click editor.
+// ---------------------------------------------------------------------------
+
+/// Recolor a pattern's points to a single tint, keeping the geometry.
+fn recolor(points: Vec<LaserPoint>, cr: u8, cg: u8, cb: u8) -> Vec<LaserPoint> {
+    points
+        .into_iter()
+        .map(|p| LaserPoint { r: cr, g: cg, b: cb, ..p })
+        .collect()
+}
+
+#[spacetimedb::reducer]
+pub fn set_laser_keyframe(
+    ctx: &ReducerContext,
+    project_id: u64,
+    frame: u32,
+    channel: u8,
+    enable: bool,
+    pattern: u8,
+    cr: u8,
+    cg: u8,
+    cb: u8,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    if frame >= project.num_frames {
+        return Err("frame out of range".to_string());
+    }
+    if channel >= 5 {
+        return Err("laser channel out of range".to_string());
+    }
+    let dups: Vec<u64> = ctx
+        .db
+        .laser_kf()
+        .project_id()
+        .filter(project_id)
+        .filter(|r| r.channel == channel && r.frame == frame)
+        .map(|r| r.id)
+        .collect();
+    for id in dups {
+        ctx.db.laser_kf().id().delete(id);
+    }
+    // Fill `points` from the library (recolored) so the keyframe is self-contained.
+    let points = ctx
+        .db
+        .pattern()
+        .id()
+        .find(pattern)
+        .map(|p| recolor(p.points, cr, cg, cb))
+        .unwrap_or_default();
+    ctx.db.laser_kf().insert(LaserKeyframe {
+        id: 0,
+        project_id,
+        frame,
+        channel,
+        enable,
+        pattern,
+        cr,
+        cg,
+        cb,
+        points,
+    });
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn set_turret_keyframe(
+    ctx: &ReducerContext,
+    project_id: u64,
+    frame: u32,
+    channel: u8,
+    state: u8,
+    pan: u8,
+    tilt: u8,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    if frame >= project.num_frames {
+        return Err("frame out of range".to_string());
+    }
+    if channel >= 4 {
+        return Err("turret channel out of range".to_string());
+    }
+    let dups: Vec<u64> = ctx
+        .db
+        .turret_kf()
+        .project_id()
+        .filter(project_id)
+        .filter(|r| r.channel == channel && r.frame == frame)
+        .map(|r| r.id)
+        .collect();
+    for id in dups {
+        ctx.db.turret_kf().id().delete(id);
+    }
+    ctx.db.turret_kf().insert(TurretKeyframe {
+        id: 0,
+        project_id,
+        frame,
+        channel,
+        state,
+        pan,
+        tilt,
+    });
+    Ok(())
+}
+
+/// Upsert the lp-1 gobo projector keyframe. (The editor UI for it is pending the
+/// gobo name list, but the reducer is complete.)
+#[spacetimedb::reducer]
+pub fn set_projector_keyframe(
+    ctx: &ReducerContext,
+    project_id: u64,
+    frame: u32,
+    channel: u8,
+    state: u8,
+    gallery: u8,
+    pattern: u8,
+    colour: u8,
+) -> Result<(), String> {
+    let project = owned_project(ctx, project_id)?;
+    if frame >= project.num_frames {
+        return Err("frame out of range".to_string());
+    }
+    if channel >= 1 {
+        return Err("projector channel out of range".to_string());
+    }
+    let dups: Vec<u64> = ctx
+        .db
+        .projector_kf()
+        .project_id()
+        .filter(project_id)
+        .filter(|r| r.channel == channel && r.frame == frame)
+        .map(|r| r.id)
+        .collect();
+    for id in dups {
+        ctx.db.projector_kf().id().delete(id);
+    }
+    ctx.db.projector_kf().insert(ProjectorKeyframe {
+        id: 0,
+        project_id,
+        frame,
+        channel,
+        state,
+        gallery,
+        pattern,
+        colour,
+    });
+    Ok(())
+}
+
+/// Seed/replace one shared library pattern (host tool only; idempotent by id).
+#[spacetimedb::reducer]
+pub fn seed_pattern(
+    ctx: &ReducerContext,
+    id: u8,
+    name: String,
+    points: Vec<LaserPoint>,
+) -> Result<(), String> {
+    if ctx.db.pattern().id().find(id).is_some() {
+        ctx.db.pattern().id().delete(id);
+    }
+    ctx.db.pattern().insert(Pattern { id, name, points });
     Ok(())
 }
 
@@ -757,6 +947,9 @@ pub struct LaserKeyframeInput {
     pub channel: u8,
     pub enable: bool,
     pub pattern: u8,
+    pub cr: u8,
+    pub cg: u8,
+    pub cb: u8,
     pub points: Vec<LaserPoint>,
 }
 
@@ -777,6 +970,9 @@ pub fn seed_laser_keyframes(
             channel: r.channel,
             enable: r.enable,
             pattern: r.pattern,
+            cr: r.cr,
+            cg: r.cg,
+            cb: r.cb,
             points: r.points,
         });
     }
@@ -998,6 +1194,9 @@ pub fn fork_project(ctx: &ReducerContext, project_id: u64) -> Result<(), String>
             channel: r.channel,
             enable: r.enable,
             pattern: r.pattern,
+            cr: r.cr,
+            cg: r.cg,
+            cb: r.cb,
             points: r.points,
         });
     }
@@ -1130,6 +1329,9 @@ pub fn save_blueprint(
             channel: r.channel,
             enable: r.enable,
             pattern: r.pattern,
+            cr: r.cr,
+            cg: r.cg,
+            cb: r.cb,
             points: r.points,
         });
     }
@@ -1228,6 +1430,9 @@ pub fn insert_blueprint(
             channel: r.channel,
             enable: r.enable,
             pattern: r.pattern,
+            cr: r.cr,
+            cg: r.cg,
+            cb: r.cb,
             points: r.points,
         });
     }
