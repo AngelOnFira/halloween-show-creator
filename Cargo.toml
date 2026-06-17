@@ -32,6 +32,10 @@ log = "0.4"
 rustfft = "6"
 # Parse the embedded laser pattern library (assets/patterns.json).
 serde_json = "1"
+# Pure-Rust ZIP writer for the "Export show" feature. Stored (no compression)
+# only — the audio is already compressed — so default features (deflate/bzip2/
+# zstd/aes/time) stay off and it builds cleanly for wasm.
+zip = { version = "2", default-features = false }
 
 # Browser (wasm) build: the SpacetimeDB Rust SDK only works in the browser with
 # its `browser` feature. The connection is driven by `frame_tick()` in a Bevy
@@ -56,6 +60,14 @@ web-sys = { version = "0.3", features = [
     "AudioContextState",
     "AudioNode",
     "AudioParam",
+    # "Export show" download: build a Blob, object-URL it, click an <a download>.
+    "Blob",
+    "Url",
+    "Document",
+    "Element",
+    "Node",
+    "HtmlElement",
+    "HtmlAnchorElement",
 ] }
 console_error_panic_hook = "0.1"
 

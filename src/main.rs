@@ -5,6 +5,7 @@
 
 mod audio;
 mod conn;
+mod export;
 mod logic;
 mod module_bindings;
 mod patterns;

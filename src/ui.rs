@@ -1193,6 +1193,23 @@ fn editor_ui(
                     }
                 }
             }
+
+            // Export this show as a rusty-halloween .zip (instructions + audio +
+            // metadata), assembled in the browser from the replicated cache.
+            ui.separator();
+            let export = ui
+                .add_enabled(song_complete, egui::Button::new("⬇ Export show"))
+                .on_hover_text(if song_complete {
+                    "Download this show as a rusty-halloween .zip"
+                } else {
+                    "Upload a song and let it finish before exporting"
+                });
+            if export.clicked() {
+                app.last_error = Some(match crate::export::export_open_project(conn, project) {
+                    Ok(file) => format!("Exported {file}"),
+                    Err(e) => format!("Export failed: {e}"),
+                });
+            }
         });
 
         ui.horizontal(|ui| {
