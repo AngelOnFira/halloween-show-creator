@@ -881,7 +881,9 @@ pub fn draw_projector_label(
     painter.text(
         pos,
         egui::Align2::CENTER_CENTER,
-        format!("Pattern {}", pr.pattern),
+        crate::projector_patterns::name_for(pr.gallery, pr.pattern)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Pattern {}", pr.pattern)),
         egui::FontId::proportional(18.0),
         col,
     );

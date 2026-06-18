@@ -37,6 +37,8 @@ pub struct FixtureEditor {
     pub proj_gallery: u8,
     pub proj_pattern: u8,
     pub proj_colour: u8,
+    /// Live text filter for the projector pattern-name picker (UI-only).
+    pub proj_pattern_filter: String,
 }
 
 /// A fixture keyframe just sent to the backend, spliced into the folded state

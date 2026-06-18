@@ -12,6 +12,7 @@ mod export;
 mod logic;
 mod module_bindings;
 mod patterns;
+mod projector_patterns;
 mod scene;
 mod state;
 mod ui;

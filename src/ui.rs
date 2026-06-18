@@ -249,6 +249,7 @@ fn load_fixture_editor(
         proj_gallery: 0,
         proj_pattern: 0,
         proj_colour: 0,
+        proj_pattern_filter: String::new(),
     };
     match kind {
         FixtureKind::Laser => {
@@ -484,9 +485,48 @@ fn fixture_editor_window(
             }
             FixtureKind::Projector => {
                 ui.checkbox(&mut ed.proj_on, "On");
-                ui.weak("Gobo name list pending — raw DMX bytes for now.");
-                ui.add(egui::Slider::new(&mut ed.proj_gallery, 0..=255).text("gallery"));
-                ui.add(egui::Slider::new(&mut ed.proj_pattern, 0..=255).text("gobo"));
+                // Pattern name picker: resolves the current (gallery, pattern)
+                // bytes to a name, and writes them back on selection.
+                let current = crate::projector_patterns::name_for(ed.proj_gallery, ed.proj_pattern)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{:#04x},{:#04x}", ed.proj_gallery, ed.proj_pattern));
+                egui::ComboBox::from_label("pattern")
+                    .selected_text(current)
+                    // Keep the popup open while typing in the filter; the default
+                    // CloseOnClick would dismiss it on the first click in the box.
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ed.proj_pattern_filter)
+                                .hint_text("filter…"),
+                        );
+                        let needle = ed.proj_pattern_filter.to_ascii_lowercase();
+                        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                            let mut last_gallery: Option<u8> = None;
+                            for pat in crate::projector_patterns::library() {
+                                if !needle.is_empty()
+                                    && !pat.name.to_ascii_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                if last_gallery != Some(pat.gallery) {
+                                    ui.label(if pat.gallery == 0xff {
+                                        egui::RichText::new("Scenes").weak()
+                                    } else {
+                                        egui::RichText::new("Gobos").weak()
+                                    });
+                                    last_gallery = Some(pat.gallery);
+                                }
+                                let selected = ed.proj_gallery == pat.gallery
+                                    && ed.proj_pattern == pat.pattern;
+                                if ui.selectable_label(selected, &pat.name).clicked() {
+                                    ed.proj_gallery = pat.gallery;
+                                    ed.proj_pattern = pat.pattern;
+                                    ui.close(); // selection made → dismiss the popup
+                                }
+                            }
+                        });
+                    });
                 ui.add(egui::Slider::new(&mut ed.proj_colour, 0..=255).text("colour"));
                 if ui.button("Apply").clicked() {
                     apply = true;
@@ -2033,6 +2073,10 @@ fn draw_frame_grid(
     let ruler_h = RULER_H;
     let label_w = 122.0_f32;
     let content_h = ruler_h + count as f32 * cell.y;
+    // Reserve one extra row of height for the allocated regions so the
+    // horizontal scrollbar sits below the last row instead of overlapping the
+    // projector row. Painting / hit-testing below still use `content_h`.
+    let alloc_h = content_h + cell.y;
     let boundaries = [laser_start, turret_start, proj_start];
     let total_rows = nl + nfx;
     let cur_frame = app.current_frame;
@@ -2042,7 +2086,7 @@ fn draw_frame_grid(
         egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL;
     ui.horizontal_top(|ui| {
         // ---- Sticky label column ----
-        let (lrect, _) = ui.allocate_exact_size(Vec2::new(label_w, content_h), Sense::hover());
+        let (lrect, _) = ui.allocate_exact_size(Vec2::new(label_w, alloc_h), Sense::hover());
         let lp = ui.painter_at(lrect);
         lp.text(
             Pos2::new(lrect.min.x + 6.0, lrect.min.y + ruler_h * 0.5),
@@ -2071,7 +2115,7 @@ fn draw_frame_grid(
             .scroll_source(scroll_no_drag)
             .show(ui, |ui| {
             let (rect, resp) =
-                ui.allocate_exact_size(Vec2::new(nf as f32 * cell.x, content_h), Sense::click_and_drag());
+                ui.allocate_exact_size(Vec2::new(nf as f32 * cell.x, alloc_h), Sense::click_and_drag());
             let painter = ui.painter_at(rect);
             let origin = rect.min;
             let row_top = origin.y + ruler_h;
@@ -2495,12 +2539,17 @@ fn draw_frame_grid(
                             None => format!("Turret {n} · —"),
                         },
                         FixtureKind::Projector => match proj_at(f) {
-                            Some(p) => format!(
-                                "Laser Projector · gobo {} · colour {} · {}",
-                                p.pattern,
-                                p.colour,
-                                if p.state > 0 { "on" } else { "off" }
-                            ),
+                            Some(p) => {
+                                let gobo = crate::projector_patterns::name_for(p.gallery, p.pattern)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| p.pattern.to_string());
+                                format!(
+                                    "Laser Projector · {} · colour {} · {}",
+                                    gobo,
+                                    p.colour,
+                                    if p.state > 0 { "on" } else { "off" }
+                                )
+                            }
                             None => "Laser Projector · —".to_string(),
                         },
                     };
