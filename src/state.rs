@@ -299,6 +299,10 @@ pub struct Playback {
     /// Set each frame by `audio::audio_playback_sync` when the playhead is being
     /// driven by the audio clock; suppresses the real-time `playback_advance`.
     pub audio_driven: bool,
+    /// Sub-frame progress toward the next frame ([0,1)) when the audio clock drives
+    /// playback. The real-time path uses `accumulator` instead; both feed
+    /// `PlayheadTime` so fixtures can interpolate between frames.
+    pub audio_fraction: f32,
 }
 
 impl Default for Playback {
@@ -309,6 +313,77 @@ impl Default for Playback {
             looping: true,
             accumulator: 0.0,
             audio_driven: false,
+            audio_fraction: 0.0,
+        }
+    }
+}
+
+/// The continuous playhead position in frame units: `current_frame` plus the
+/// sub-frame fraction toward the next frame while playing (0 when paused). Written
+/// once per frame before `recompute_fixtures` so fixtures can tween smoothly
+/// between integer keyframes instead of snapping.
+#[derive(Resource, Default)]
+pub struct PlayheadTime {
+    pub t: f32,
+}
+
+/// Where an emitter (laser / turret / projector) sits in the world and which way
+/// it casts at rest. Populated from named glTF nodes when present, else the
+/// built-in defaults below. `forward`/`up` are unit vectors; `scale` hints at the
+/// projection footprint size on the surface it lights.
+#[derive(Clone, Copy)]
+pub struct EmitterPlacement {
+    pub origin: Vec3,
+    pub forward: Vec3,
+    pub up: Vec3,
+    pub scale: f32,
+}
+
+/// Per-family emitter placements, indexed by channel. Defaults reproduce the
+/// legacy hardware layout (4 turrets across the top; 5 lasers + 1 gobo projector
+/// fanned in front, casting at the back wall). `spawn_gltf_fixtures` overwrites
+/// only the indices for which a `Laser.<n>`/`Turret.<n>`/`Projector.<n>` node
+/// exists, so partial scenes keep these defaults.
+#[derive(Resource)]
+pub struct EmitterPlacements {
+    pub lasers: Vec<EmitterPlacement>,
+    pub turrets: Vec<EmitterPlacement>,
+    pub projectors: Vec<EmitterPlacement>,
+}
+
+impl Default for EmitterPlacements {
+    fn default() -> Self {
+        // 4 turrets spread across the top, resting pointing down (aim is driven
+        // each frame from pan/tilt).
+        let turrets = (0..4)
+            .map(|i| EmitterPlacement {
+                origin: Vec3::new(-3.0 + i as f32 * 2.0, 5.5, 1.0),
+                forward: Vec3::NEG_Y,
+                up: Vec3::Z,
+                scale: 1.0,
+            })
+            .collect();
+        // 5 lasers fanned along the front, each casting back at the wall so their
+        // shapes land at distinct spots instead of stacking on one plane.
+        let lasers = (0..5)
+            .map(|i| EmitterPlacement {
+                origin: Vec3::new(-3.0 + i as f32 * 1.5, 4.0, 3.0),
+                forward: Vec3::NEG_Z,
+                up: Vec3::Y,
+                scale: 2.0,
+            })
+            .collect();
+        // 1 gobo projector, centered, casting at the back wall.
+        let projectors = vec![EmitterPlacement {
+            origin: Vec3::new(0.0, 4.5, 3.0),
+            forward: Vec3::NEG_Z,
+            up: Vec3::Y,
+            scale: 2.5,
+        }];
+        Self {
+            lasers,
+            turrets,
+            projectors,
         }
     }
 }
@@ -338,4 +413,9 @@ pub struct FixtureGrid {
     pub lasers: Vec<Option<LaserKeyframe>>,
     pub projectors: Vec<Option<ProjectorKeyframe>>,
     pub turrets: Vec<Option<TurretKeyframe>>,
+    /// All turret keyframe rows for the open project (project-filtered, with
+    /// optimistic pending edits merged in) — kept so the render/animation systems
+    /// can interpolate between keyframes via `logic::turret_pose_at` without
+    /// re-reading the connection.
+    pub turret_rows: Vec<TurretKeyframe>,
 }

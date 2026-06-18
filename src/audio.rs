@@ -678,7 +678,10 @@ pub fn audio_playback_sync(
         pb.audio_driven = true;
         if let Some(ctx) = &audio.ctx {
             let elapsed = ctx.current_time() - audio.start_ctx_time;
-            let frame = audio.start_frame as f64 + (elapsed * pb.fps as f64).round();
+            // Keep the unrounded position so the sub-frame remainder can drive
+            // smooth fixture interpolation (see `PlayheadTime`).
+            let frame_f = audio.start_frame as f64 + elapsed * pb.fps as f64;
+            let frame = frame_f.floor();
             let nf = {
                 let guard = conn.state.borrow();
                 match &*guard {
@@ -695,14 +698,17 @@ pub fn audio_playback_sync(
                     // Restart the source from the top for a seamless loop.
                     stop_source(&mut audio);
                     app.current_frame = 0;
+                    pb.audio_fraction = 0.0;
                     start_source(&mut audio, 0, pb.fps, first_beat_secs);
                 } else {
                     app.current_frame = nf.saturating_sub(1);
+                    pb.audio_fraction = 0.0;
                     pb.playing = false;
                     stop_source(&mut audio);
                 }
             } else {
                 app.current_frame = frame as u32;
+                pb.audio_fraction = frame_f.fract() as f32;
             }
         }
     }

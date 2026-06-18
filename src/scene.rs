@@ -14,13 +14,20 @@
 use bevy::asset::LoadState;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::light::SpotLightTexture;
 use bevy::prelude::*;
-use bevy_egui::EguiContexts;
+use bevy::render::view::Hdr;
+use bevy_egui::{egui, EguiContexts};
+
+use crate::cookies::PatternCookies;
 
 use crate::conn::{ConnResource, ConnState};
-use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes};
+use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes, turret_pose_at};
 use crate::module_bindings::*;
-use crate::state::{AppState, FixtureGrid, HeldGrid, PendingFixture, Playback};
+use crate::state::{
+    AppState, EmitterPlacement, EmitterPlacements, FixtureGrid, HeldGrid, PendingFixture, Playback,
+    PlayheadTime,
+};
 use spacetimedb_sdk::{DbContext, Table};
 
 /// Channel counts for the rich fixtures (mirrors the legacy hardware layout).
@@ -40,6 +47,29 @@ const DEFAULT_FIXTURES: u32 = 12;
 pub struct LightFixture {
     pub index: u32,
 }
+
+/// Which rich-fixture family a spawned `SpotLight` emitter belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EmitterFamily {
+    Laser,
+    Turret,
+    Projector,
+}
+
+/// Marks a real `SpotLight` entity standing in for laser/turret/projector
+/// `channel`. `update_emitters` drives its intensity/colour/aim from the folded
+/// fixture state each frame.
+#[derive(Component)]
+pub struct Emitter {
+    pub family: EmitterFamily,
+    pub channel: u8,
+}
+
+/// Spotlight intensities (lumens) for the emitter families. Tuned for the small
+/// stage; refined alongside the volumetric beams.
+const TURRET_INTENSITY: f32 = 400_000.0;
+const LASER_INTENSITY: f32 = 200_000.0;
+const PROJECTOR_INTENSITY: f32 = 400_000.0;
 
 /// Tracks the glTF scene load so we spawn fixtures exactly once.
 #[derive(Resource)]
@@ -102,11 +132,23 @@ impl Default for SceneConfig {
 /// Startup: camera, key light, and kick off the glTF load. The set geometry
 /// (fixtures + house) comes entirely from the Blender scene; the glTF carries no
 /// lights, so we add one directional key light here.
-pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
+pub fn setup_scene_3d(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     // `orbit_camera` overwrites this transform every frame; the starting values
     // just give a sensible first frame before the orbit resource is read.
+    // HDR + a depth prepass are needed by the volumetric-fog beams; MSAA off keeps
+    // the prepass simple; a low ambient keeps the dark stage from going pure black.
     commands.spawn((
         Camera3d::default(),
+        Hdr,
+        AmbientLight {
+            brightness: 40.0,
+            ..default()
+        },
         Transform::from_xyz(0.0, 3.5, 13.0).looking_at(Vec3::new(0.0, 0.6, 0.0), Vec3::Y),
         OrbitCamera,
     ));
@@ -116,6 +158,29 @@ pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
             ..default()
         },
         Transform::from_xyz(3.0, 8.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // A dark back wall + floor so the spotlights have surfaces to land on (and the
+    // laser shapes have a wall to project onto). Harmless extra geometry if the
+    // Blender scene already supplies its own stage.
+    let surface = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.06, 0.06, 0.08),
+        perceptual_roughness: 0.95,
+        ..default()
+    });
+    // Back wall: face at z ≈ -4.1, where the lasers/projector aim.
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(40.0, 24.0, 0.4))),
+        MeshMaterial3d(surface.clone()),
+        Transform::from_xyz(0.0, 8.0, -4.3),
+        Name::new("BackWall"),
+    ));
+    // Floor at y = 0, where the turrets aim.
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(40.0, 0.4, 30.0))),
+        MeshMaterial3d(surface),
+        Transform::from_xyz(0.0, -0.2, -2.0),
+        Name::new("Floor"),
     ));
 
     commands.insert_resource(GltfScene {
@@ -130,6 +195,166 @@ fn parse_light_index(name: &str) -> Option<u32> {
         .and_then(|s| s.trim().parse::<u32>().ok())
 }
 
+fn fam_name(f: EmitterFamily) -> &'static str {
+    match f {
+        EmitterFamily::Laser => "Laser",
+        EmitterFamily::Turret => "Turret",
+        EmitterFamily::Projector => "Projector",
+    }
+}
+
+/// Parse an emitter node name like `Turret.002` into its family + channel.
+fn parse_emitter(name: &str) -> Option<(EmitterFamily, u32)> {
+    let name = name.trim();
+    for (prefix, fam) in [
+        ("Laser.", EmitterFamily::Laser),
+        ("Turret.", EmitterFamily::Turret),
+        ("Projector.", EmitterFamily::Projector),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                return Some((fam, n));
+            }
+        }
+    }
+    None
+}
+
+/// Read emitter placements from any `Laser.<n>`/`Turret.<n>`/`Projector.<n>` glTF
+/// nodes (mesh-less Empties or fixture models), starting from the built-in
+/// defaults and overwriting only the channels that have a node. A fixture casts
+/// along its node's local −Z; local +Y is "up".
+fn emitter_placements_from_gltf(
+    gltf: &Gltf,
+    gltf_nodes: &Assets<GltfNode>,
+) -> EmitterPlacements {
+    let mut placements = EmitterPlacements::default();
+    for node_handle in &gltf.nodes {
+        let Some(node) = gltf_nodes.get(node_handle) else {
+            continue;
+        };
+        let Some((fam, n)) = parse_emitter(&node.name) else {
+            continue;
+        };
+        let rot = node.transform.rotation;
+        let p = EmitterPlacement {
+            origin: node.transform.translation,
+            forward: rot * Vec3::NEG_Z,
+            up: rot * Vec3::Y,
+            scale: 2.0,
+        };
+        let target = match fam {
+            EmitterFamily::Laser => &mut placements.lasers,
+            EmitterFamily::Turret => &mut placements.turrets,
+            EmitterFamily::Projector => &mut placements.projectors,
+        };
+        if let Some(slot) = target.get_mut(n as usize) {
+            *slot = p;
+        }
+    }
+    placements
+}
+
+/// Spawn, per laser/turret/projector channel: an always-visible marker body, a
+/// real `SpotLight` that lights the scene, and an additive translucent cone that
+/// makes the beam visible in mid-air. The light + beam start hidden; the beam is a
+/// child of the light so it sweeps with the (turret) aim. `update_emitters`
+/// shows/hides + colours them per the timeline.
+fn spawn_emitters(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    cookies: &PatternCookies,
+    placements: &EmitterPlacements,
+) {
+    use std::f32::consts::FRAC_PI_2;
+    let body = meshes.add(Sphere::new(0.18));
+    let mut spawn_one = |fam: EmitterFamily,
+                         ch: usize,
+                         p: &EmitterPlacement,
+                         inner: f32,
+                         outer: f32,
+                         shadows: bool,
+                         tint: Color,
+                         beam_len: f32| {
+        let lm = tint.to_linear();
+        // Always-visible marker so the placement is findable even when dark.
+        let body_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.08, 0.08, 0.1),
+            emissive: LinearRgba::rgb(lm.red * 0.5, lm.green * 0.5, lm.blue * 0.5),
+            ..default()
+        });
+        commands.spawn((
+            Mesh3d(body.clone()),
+            MeshMaterial3d(body_mat),
+            Transform::from_translation(p.origin),
+            Name::new(format!("{}.{ch:03}.body", fam_name(fam))),
+        ));
+        // Additive cone showing the beam in the air. The `Cone` primitive points
+        // +Y with its apex at +height/2; rotate +Y -> +Z and shift back by
+        // height/2 so the apex sits at the fixture and the cone opens along -Z
+        // (the spotlight's forward).
+        let beam_radius = (beam_len * outer.tan()).max(0.15);
+        let beam_mesh = meshes.add(Cone {
+            radius: beam_radius,
+            height: beam_len,
+        });
+        let beam_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(lm.red, lm.green, lm.blue, 0.18),
+            emissive: LinearRgba::rgb(lm.red * 0.25, lm.green * 0.25, lm.blue * 0.25),
+            alpha_mode: AlphaMode::Add,
+            cull_mode: None,
+            unlit: true,
+            ..default()
+        });
+        let beam_tf = Transform::from_translation(Vec3::new(0.0, 0.0, -beam_len / 2.0))
+            .with_rotation(Quat::from_rotation_x(FRAC_PI_2));
+        let mut entity = commands.spawn((
+            SpotLight {
+                color: tint,
+                intensity: 0.0, // lit by `update_emitters`
+                range: 40.0,
+                radius: 0.0,
+                inner_angle: inner,
+                outer_angle: outer,
+                shadows_enabled: shadows,
+                ..default()
+            },
+            Transform::from_translation(p.origin).looking_to(p.forward, p.up),
+            Visibility::Hidden, // shown by `update_emitters` when lit
+            Emitter {
+                family: fam,
+                channel: ch as u8,
+            },
+            Name::new(format!("{}.{ch:03}.light", fam_name(fam))),
+        ));
+        entity.with_children(|parent| {
+            parent.spawn((
+                Mesh3d(beam_mesh),
+                MeshMaterial3d(beam_mat),
+                beam_tf,
+                Name::new(format!("{}.{ch:03}.beam", fam_name(fam))),
+            ));
+        });
+        // Lasers project their pattern as a gobo cookie; `update_emitters` swaps
+        // the image to the laser's current pattern. Seed with pattern 0.
+        if fam == EmitterFamily::Laser {
+            if let Some(h) = cookies.images.first() {
+                entity.insert(SpotLightTexture { image: h.clone() });
+            }
+        }
+    };
+    for (i, p) in placements.turrets.iter().enumerate() {
+        spawn_one(EmitterFamily::Turret, i, p, 0.10, 0.22, true, Color::srgb(0.6, 0.85, 1.0), 8.0);
+    }
+    for (i, p) in placements.lasers.iter().enumerate() {
+        spawn_one(EmitterFamily::Laser, i, p, 0.03, 0.10, false, Color::srgb(0.4, 1.0, 0.5), 9.0);
+    }
+    for (i, p) in placements.projectors.iter().enumerate() {
+        spawn_one(EmitterFamily::Projector, i, p, 0.18, 0.38, true, Color::srgb(0.85, 0.5, 0.9), 8.0);
+    }
+}
+
 /// Spawn a fixture per `Light.<n>` glTF node once the asset has loaded (or a
 /// procedural row if the load fails / has no such nodes).
 pub fn spawn_gltf_fixtures(
@@ -142,6 +367,7 @@ pub fn spawn_gltf_fixtures(
     gltf_nodes: Res<Assets<GltfNode>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    cookies: Res<PatternCookies>,
 ) {
     if scene.spawned {
         return;
@@ -224,11 +450,19 @@ pub fn spawn_gltf_fixtures(
                     mesh_count - light_count
                 );
             }
+            // Real spotlight emitters (lasers / turrets / gobo projector), placed
+            // from any emitter nodes in the scene or the built-in defaults.
+            let placements = emitter_placements_from_gltf(gltf, &gltf_nodes);
+            spawn_emitters(&mut commands, &mut meshes, &mut materials, &cookies, &placements);
+            commands.insert_resource(placements);
             scene.spawned = true;
         }
         LoadState::Failed(_) => {
             warn!("failed to load {SCENE_GLB}; using procedural fixtures");
             spawn_procedural(&mut commands, &mut meshes, &mut materials);
+            let placements = EmitterPlacements::default();
+            spawn_emitters(&mut commands, &mut meshes, &mut materials, &cookies, &placements);
+            commands.insert_resource(placements);
             scene.spawned = true;
         }
         _ => {}
@@ -473,15 +707,23 @@ pub fn recompute_fixtures(
     fx.lasers = fold_fixtures(&lasers, frame, NUM_LASERS, |r| r.channel, |r| r.frame);
     fx.projectors = fold_fixtures(&projectors, frame, NUM_PROJECTORS, |r| r.channel, |r| r.frame);
     fx.turrets = fold_fixtures(&turrets, frame, NUM_TURRETS, |r| r.channel, |r| r.frame);
+    // Keep the full turret keyframe set so the render/animation systems can tween
+    // between keyframes (held semantics above are still used for the timeline).
+    fx.turret_rows = turrets;
 }
 
-/// Map a legacy laser galvo point (x,y in 0..=300) onto the projection plane
-/// behind the fixtures.
-fn laser_to_world(x: i16, y: i16) -> Vec3 {
-    let nx = (x as f32 / 300.0 - 0.5) * 10.0;
-    // Galvo Y increases downward, so invert it for world-up.
-    let ny = 5.5 - (y as f32 / 300.0) * 5.0;
-    Vec3::new(nx, ny, -4.0)
+/// Publish the continuous playhead (`current_frame` + sub-frame fraction) so
+/// fixtures can interpolate smoothly between integer keyframes. Runs after the
+/// frame-advance systems and before `recompute_fixtures`. Paused => fraction 0.
+pub fn publish_playhead(app: Res<AppState>, pb: Res<Playback>, mut ph: ResMut<PlayheadTime>) {
+    let frac = if !pb.playing {
+        0.0
+    } else if pb.audio_driven {
+        pb.audio_fraction
+    } else {
+        pb.accumulator
+    };
+    ph.t = app.current_frame as f32 + frac.clamp(0.0, 1.0);
 }
 
 /// 3-bit (0..=7) per-channel laser colour → linear-ish display colour.
@@ -489,15 +731,11 @@ fn laser_color(r: u8, g: u8, b: u8) -> Color {
     Color::srgb(r as f32 / 7.0, g as f32 / 7.0, b as f32 / 7.0)
 }
 
-/// Base (mount) position of turret `i`, spread across the top of the scene.
-fn turret_base(i: usize) -> Vec3 {
-    Vec3::new(-3.0 + i as f32 * 2.0, 5.5, 1.0)
-}
-
-/// Beam direction for a moving head from its DMX pan/tilt bytes.
-fn turret_dir(pan: u8, tilt: u8) -> Vec3 {
-    let yaw = (pan as f32 / 255.0 - 0.5) * std::f32::consts::PI; // ±90°
-    let pitch = (tilt as f32 / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90° downward
+/// Beam direction for a moving head from its (possibly interpolated) DMX pan/tilt
+/// values (0..=255).
+fn turret_dir_f(pan: f32, tilt: f32) -> Vec3 {
+    let yaw = (pan / 255.0 - 0.5) * std::f32::consts::PI; // ±90°
+    let pitch = (tilt / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90° downward
     let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
     (rot * Vec3::NEG_Y).normalize()
 }
@@ -507,77 +745,144 @@ fn gobo_color(colour: u8) -> Color {
     Color::hsl((colour as f32 / 255.0) * 360.0, 0.85, 0.6)
 }
 
-/// Draw the rich fixtures for the open project as emissive gizmo lines.
-pub fn draw_fixtures(app: Res<AppState>, fx: Res<FixtureGrid>, mut gizmos: Gizmos) {
+/// Drive every emitter `SpotLight` from the folded fixture state: intensity
+/// (0 = off), colour, and — for turrets — the eased aim at the continuous
+/// playhead so the cone sweeps smoothly. Runs after `recompute_fixtures`.
+pub fn update_emitters(
+    app: Res<AppState>,
+    fx: Res<FixtureGrid>,
+    placements: Res<EmitterPlacements>,
+    playhead: Res<PlayheadTime>,
+    cookies: Res<PatternCookies>,
+    mut q: Query<(
+        &Emitter,
+        &mut SpotLight,
+        &mut Transform,
+        &mut Visibility,
+        Option<&mut SpotLightTexture>,
+    )>,
+) {
+    let has_project = app.open_project.is_some();
+    for (em, mut light, mut tf, mut vis, tex) in &mut q {
+        let mut lit = false;
+        if has_project {
+            match em.family {
+                EmitterFamily::Turret => {
+                    if let Some(pose) = turret_pose_at(&fx.turret_rows, em.channel, playhead.t) {
+                        if pose.on {
+                            if let Some(p) = placements.turrets.get(em.channel as usize) {
+                                let dir = turret_dir_f(pose.pan, pose.tilt);
+                                // Pick a non-parallel up so `looking_to` stays stable
+                                // whether the head points down or out.
+                                let up = if dir.dot(Vec3::Y).abs() > 0.95 {
+                                    Vec3::Z
+                                } else {
+                                    Vec3::Y
+                                };
+                                *tf = Transform::from_translation(p.origin).looking_to(dir, up);
+                            }
+                            light.color = Color::srgb(0.6, 0.85, 1.0);
+                            light.intensity = TURRET_INTENSITY;
+                            lit = true;
+                        }
+                    }
+                }
+                EmitterFamily::Laser => {
+                    if let Some(Some(l)) = fx.lasers.get(em.channel as usize) {
+                        if l.enable {
+                            light.color = laser_color(l.cr, l.cg, l.cb);
+                            light.intensity = LASER_INTENSITY;
+                            // Project the laser's current pattern as a gobo cookie.
+                            if let (Some(mut tex), Some(h)) =
+                                (tex, cookies.images.get(l.pattern as usize))
+                            {
+                                tex.image = h.clone();
+                            }
+                            lit = true;
+                        }
+                    }
+                }
+                EmitterFamily::Projector => {
+                    if let Some(Some(pr)) = fx.projectors.get(em.channel as usize) {
+                        if pr.state > 0 {
+                            light.color = gobo_color(pr.colour);
+                            light.intensity = PROJECTOR_INTENSITY;
+                            lit = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !lit {
+            light.intensity = 0.0;
+        }
+        // Show the light + its beam cone only when lit.
+        *vis = if lit {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+/// Draw the gobo projector's "Pattern N" title as a screen-space label anchored
+/// where its beam meets the back wall. Uses an egui overlay since the trimmed
+/// feature set has no in-world text.
+pub fn draw_projector_label(
+    mut contexts: EguiContexts,
+    app: Res<AppState>,
+    fx: Res<FixtureGrid>,
+    placements: Res<EmitterPlacements>,
+    cam: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
+) {
     if app.open_project.is_none() {
         return;
     }
-
-    // Lasers: draw each lit segment of the shape, honouring beam blanking and
-    // the closed-loop return (see `patterns::outline_segments`). Prefer the
-    // stored points (legacy per-point colour); otherwise the library shape by
-    // id, tinted by the keyframe colour.
-    for laser in fx.lasers.iter().flatten() {
-        if !laser.enable {
-            continue;
-        }
-        let (pts, tint): (Vec<crate::patterns::PatternPoint>, Option<(u8, u8, u8)>) =
-            if laser.points.len() >= 2 {
-                let v = laser
-                    .points
-                    .iter()
-                    .map(|p| crate::patterns::PatternPoint {
-                        x: p.x,
-                        y: p.y,
-                        r: p.r,
-                        g: p.g,
-                        b: p.b,
-                    })
-                    .collect();
-                (v, None)
-            } else if let Some(pat) = crate::patterns::get(laser.pattern) {
-                (pat.points.clone(), Some((laser.cr, laser.cg, laser.cb)))
-            } else {
-                continue;
-            };
-        for (src, dst) in crate::patterns::outline_segments(&pts) {
-            let (r, g, b) = tint.unwrap_or((src.r, src.g, src.b));
-            gizmos.line(
-                laser_to_world(src.x, src.y),
-                laser_to_world(dst.x, dst.y),
-                laser_color(r, g, b),
-            );
-        }
+    let Some(Some(pr)) = fx.projectors.first() else {
+        return;
+    };
+    if pr.state == 0 {
+        return;
     }
-
-    // Gobo projector: a coloured ring on the back wall when lit.
-    if let Some(Some(proj)) = fx.projectors.first() {
-        if proj.state > 0 {
-            let center = Vec3::new(0.0, 4.0, -3.95);
-            let color = gobo_color(proj.colour);
-            let ring = (0..=24).map(|i| {
-                let a = i as f32 / 24.0 * std::f32::consts::TAU;
-                center + Vec3::new(a.cos() * 1.6, a.sin() * 1.6, 0.0)
-            });
-            gizmos.linestrip(ring, color);
-        }
+    let Some(p) = placements.projectors.first() else {
+        return;
+    };
+    // Intersect the projector's forward ray with the back wall plane.
+    const WALL_Z: f32 = -4.1;
+    let denom = p.forward.z;
+    if denom.abs() < 1e-4 {
+        return;
     }
-
-    // Turrets: a base marker plus a beam that fades from the head outward.
-    for (i, turret) in fx.turrets.iter().enumerate() {
-        if let Some(t) = turret {
-            if t.state > 0 {
-                let base = turret_base(i);
-                let end = base + turret_dir(t.pan, t.tilt) * 6.0;
-                let near = Color::srgb(0.75, 0.95, 1.0);
-                let far = Color::srgba(0.3, 0.6, 0.9, 0.12);
-                gizmos.linestrip_gradient([(base, near), (end, far)]);
-                // Small cross marking the fixed mount position.
-                let s = 0.18;
-                let m = Color::srgb(0.5, 0.8, 1.0);
-                gizmos.line(base - Vec3::X * s, base + Vec3::X * s, m);
-                gizmos.line(base - Vec3::Z * s, base + Vec3::Z * s, m);
-            }
-        }
+    let t = (WALL_Z - p.origin.z) / denom;
+    if t <= 0.0 {
+        return;
     }
+    let hit = p.origin + p.forward * t;
+
+    let Ok((camera, cam_tf)) = cam.single() else {
+        return;
+    };
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let Ok(px) = camera.world_to_viewport(cam_tf, hit) else {
+        return; // behind camera / off screen
+    };
+    let ppp = ctx.pixels_per_point();
+    let pos = egui::pos2(px.x / ppp, px.y / ppp);
+    let c = gobo_color(pr.colour).to_srgba();
+    let col = egui::Color32::from_rgb(
+        (c.red * 255.0) as u8,
+        (c.green * 255.0) as u8,
+        (c.blue * 255.0) as u8,
+    );
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("projector_label"));
+    let painter = ctx.layer_painter(layer);
+    painter.text(
+        pos,
+        egui::Align2::CENTER_CENTER,
+        format!("Pattern {}", pr.pattern),
+        egui::FontId::proportional(18.0),
+        col,
+    );
 }

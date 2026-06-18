@@ -7,6 +7,7 @@ mod audio;
 #[cfg(target_arch = "wasm32")]
 mod auth;
 mod conn;
+mod cookies;
 mod export;
 mod logic;
 mod module_bindings;
@@ -18,7 +19,7 @@ mod ui;
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
-use state::{AppState, FixtureGrid, HeldGrid, Playback};
+use state::{AppState, EmitterPlacements, FixtureGrid, HeldGrid, Playback, PlayheadTime};
 
 fn main() {
     #[cfg(target_arch = "wasm32")]
@@ -48,8 +49,12 @@ fn main() {
         .init_resource::<HeldGrid>()
         .init_resource::<FixtureGrid>()
         .init_resource::<Playback>()
+        .init_resource::<PlayheadTime>()
+        .init_resource::<EmitterPlacements>()
+        .init_resource::<cookies::PatternCookies>()
         .init_resource::<scene::CameraOrbit>()
         .add_systems(Startup, scene::setup_scene_3d)
+        .add_systems(Startup, cookies::generate_cookies)
         .add_systems(Startup, conn::setup_connection)
         .add_systems(Startup, audio::setup_audio)
         .add_systems(PreUpdate, conn::pump_connection)
@@ -69,13 +74,15 @@ fn main() {
                 scene::recompute_held,
                 audio::audio_playback_sync,
                 scene::playback_advance,
+                scene::publish_playhead,
                 scene::recompute_fixtures,
+                scene::update_emitters,
                 scene::apply_lights,
             )
                 .chain(),
         )
-        .add_systems(Update, scene::draw_fixtures)
         .add_systems(Update, (scene::camera_drag, scene::orbit_camera).chain())
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
+        .add_systems(EguiPrimaryContextPass, scene::draw_projector_label)
         .run();
 }

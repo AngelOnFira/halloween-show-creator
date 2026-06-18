@@ -22,7 +22,12 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_log",
     "bevy_state",
     "std",
-    "webgl2",
+    # WebGPU (not WebGL2) so we get real volumetric fog / light shafts on wasm —
+    # bevy_light's volumetric module requires WebGPU on the web. Narrows browser
+    # support to WebGPU-capable browsers.
+    "webgpu",
+    # Spotlight gobo/cookie projection (SpotLightTexture) — off by default.
+    "pbr_light_textures",
     "png",
     "tonemapping_luts",
 ] }
