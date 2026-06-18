@@ -13,6 +13,24 @@
 
 use spacetimedb::{Identity, ReducerContext, SpacetimeType, Table, Timestamp};
 
+/// The SpacetimeAuth (OIDC) issuer we trust for end-user logins. Discord is
+/// brokered behind it, so a logged-in Discord user's token carries this `iss`
+/// claim (and SpacetimeDB-reissued reconnect tokens preserve it, since identity
+/// is derived from `iss`+`sub`). Anonymous / CLI identities have a different
+/// issuer and are rejected by `require_login`.
+const TRUSTED_ISSUER: &str = "https://auth.spacetimedb.com/oidc";
+
+/// Require the caller to be a logged-in SpacetimeAuth user. Applied to every
+/// user-facing mutation. The host-only `seed_*` reducers (run by the show-seeder
+/// tool, which authenticates with a different issuer) are intentionally NOT
+/// gated, so seeding still works.
+fn require_login(ctx: &ReducerContext) -> Result<(), String> {
+    match ctx.sender_auth().jwt() {
+        Some(claims) if claims.issuer() == TRUSTED_ISSUER => Ok(()),
+        _ => Err("Please log in with Discord to make changes".to_string()),
+    }
+}
+
 /// One light show. Owned by the identity that created it.
 #[spacetimedb::table(accessor = project, public)]
 pub struct Project {
@@ -155,6 +173,16 @@ pub struct Pattern {
 #[spacetimedb::reducer(init)]
 pub fn init(_ctx: &ReducerContext) {}
 
+/// Log the caller's auth on connect — handy for confirming the SpacetimeAuth
+/// issuer (and that reconnect tokens preserve it). Safe no-op otherwise.
+#[spacetimedb::reducer(client_connected)]
+pub fn on_client_connected(ctx: &ReducerContext) {
+    match ctx.sender_auth().jwt() {
+        Some(c) => log::info!("connected: iss={} sub={}", c.issuer(), c.subject()),
+        None => log::info!("connected: no jwt (identity {})", ctx.sender()),
+    }
+}
+
 /// Create a new, empty light-show project owned by the caller.
 #[spacetimedb::reducer]
 pub fn create_project(
@@ -163,6 +191,7 @@ pub fn create_project(
     num_lights: u32,
     num_frames: u32,
 ) -> Result<(), String> {
+    require_login(ctx)?;
     let name = name.trim();
     if name.is_empty() {
         return Err("Project name cannot be empty".to_string());
@@ -193,6 +222,7 @@ pub fn append_edit(
     frame: u32,
     state: u8,
 ) -> Result<(), String> {
+    require_login(ctx)?;
     let Some(project) = ctx.db.project().id().find(project_id) else {
         return Err("Project not found".to_string());
     };
@@ -230,6 +260,7 @@ pub fn append_edit(
 /// Resolve a project the caller owns, or an error. Shared by the bulk
 /// paste reducers below (region copy/paste & blueprint insertion).
 fn owned_project(ctx: &ReducerContext, project_id: u64) -> Result<Project, String> {
+    require_login(ctx)?;
     let Some(project) = ctx.db.project().id().find(project_id) else {
         return Err("Project not found".to_string());
     };
@@ -696,6 +727,7 @@ pub fn begin_song_upload(
     if project.owner != ctx.sender() {
         return Err("You do not own this project".to_string());
     }
+    require_login(ctx)?;
     if byte_len == 0 {
         return Err("Audio file is empty".to_string());
     }
@@ -751,6 +783,7 @@ pub fn append_song_chunk(
     if song.owner != ctx.sender() {
         return Err("You do not own this song".to_string());
     }
+    require_login(ctx)?;
     if data.len() > CHUNK_SIZE {
         return Err("Chunk exceeds CHUNK_SIZE".to_string());
     }
@@ -789,6 +822,7 @@ pub fn append_song_chunk(
 /// Remove the project's song and all its chunks.
 #[spacetimedb::reducer]
 pub fn delete_song(ctx: &ReducerContext, project_id: u64) -> Result<(), String> {
+    require_login(ctx)?;
     let Some(project) = ctx.db.project().id().find(project_id) else {
         return Err("Project not found".to_string());
     };
@@ -1156,6 +1190,7 @@ pub fn seed_song_chunk(
 /// by the caller: its edit log, all fixture keyframes, and its song + chunks.
 #[spacetimedb::reducer]
 pub fn fork_project(ctx: &ReducerContext, project_id: u64) -> Result<(), String> {
+    require_login(ctx)?;
     let Some(src) = ctx.db.project().id().find(project_id) else {
         return Err("Project not found".to_string());
     };
@@ -1282,6 +1317,7 @@ pub fn save_blueprint(
     projectors: Vec<ProjectorKeyframeInput>,
     turrets: Vec<TurretKeyframeInput>,
 ) -> Result<(), String> {
+    require_login(ctx)?;
     let name = name.trim();
     if name.is_empty() {
         return Err("Blueprint name cannot be empty".to_string());
@@ -1477,6 +1513,7 @@ pub fn insert_blueprint(
 /// Delete a blueprint the caller owns (and all of its content).
 #[spacetimedb::reducer]
 pub fn delete_blueprint(ctx: &ReducerContext, blueprint_id: u64) -> Result<(), String> {
+    require_login(ctx)?;
     let Some(bp) = ctx.db.project().id().find(blueprint_id) else {
         return Err("Blueprint not found".to_string());
     };

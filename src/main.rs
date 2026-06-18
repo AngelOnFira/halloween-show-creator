@@ -4,6 +4,8 @@
 //! viewport's fixtures light up to mirror the timeline.
 
 mod audio;
+#[cfg(target_arch = "wasm32")]
+mod auth;
 mod conn;
 mod export;
 mod logic;

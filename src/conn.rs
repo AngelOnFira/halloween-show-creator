@@ -25,10 +25,13 @@ use crate::state::AppState;
 
 pub const HOST: &str = "https://maincloud.spacetimedb.com";
 pub const DB_NAME: &str = "stdb-lightshow-spike";
-#[cfg(target_arch = "wasm32")]
-const TOKEN_KEY: &str = "stdb-lightshow-token";
 
 pub enum ConnState {
+    /// No session token yet — the user must log in with Discord first.
+    NeedsLogin,
+    /// Exchanging an OIDC authorization code for a token (post-redirect).
+    Authenticating,
+    /// Have a token; building the SpacetimeDB connection.
     Connecting,
     Connected(DbConnection),
     Failed(String),
@@ -49,11 +52,15 @@ pub struct ConnResource {
     pub subs: RefCell<SubTracker>,
 }
 
-/// Startup (exclusive) system: kick off the async connection and store it.
+/// Startup (exclusive) system: decide the initial auth state and (if we already
+/// have a token) kick off the async connection, then store the resource.
 pub fn setup_connection(world: &mut World) {
-    let shared = Rc::new(RefCell::new(ConnState::Connecting));
+    // Default to NeedsLogin; `bootstrap` upgrades it to Connecting/Authenticating
+    // when a token or an OIDC callback is present. On native (no wasm) the app
+    // simply sits on the login screen — the connection is wasm-only.
+    let shared = Rc::new(RefCell::new(ConnState::NeedsLogin));
     #[cfg(target_arch = "wasm32")]
-    connect(shared.clone());
+    bootstrap(shared.clone());
     world.insert_non_send_resource(ConnResource {
         state: shared,
         subs: RefCell::new(SubTracker::default()),
@@ -102,17 +109,60 @@ pub fn sync_subscriptions(conn: NonSend<ConnResource>, app: Res<AppState>) {
     subs.chunk_project = app.open_project;
 }
 
+/// Decide how to get online: complete an OIDC redirect if we're returning from
+/// one, else silently reconnect with a stored token, else require login.
 #[cfg(target_arch = "wasm32")]
-fn connect(shared: Rc<RefCell<ConnState>>) {
-    use spacetimedb_sdk::credentials::{LocalStorage, Storage};
+fn bootstrap(shared: Rc<RefCell<ConnState>>) {
+    use crate::auth;
+
+    // 1. Returning from a Discord/SpacetimeAuth redirect (?code=…)?
+    if let Some(code) = auth::pending_code() {
+        *shared.borrow_mut() = ConnState::Authenticating;
+        let sh = shared.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match auth::exchange(code).await {
+                Ok(id_token) => {
+                    auth::clear_session();
+                    auth::clear_callback_url();
+                    connect_with(sh, id_token);
+                }
+                Err(e) => {
+                    auth::clear_session();
+                    auth::clear_callback_url();
+                    log::error!("OIDC exchange failed: {e}");
+                    *sh.borrow_mut() = ConnState::Failed(format!("Login failed: {e}"));
+                }
+            }
+        });
+        return;
+    }
+
+    // 2. Already have a session token → silent reconnect.
+    if let Some(token) = auth::stored_token() {
+        connect_with(shared, token);
+        return;
+    }
+
+    // 3. Otherwise, the UI shows the Discord login screen.
+    *shared.borrow_mut() = ConnState::NeedsLogin;
+}
+
+/// Build the SpacetimeDB connection with the given token (an OIDC id_token on
+/// first login, or the persisted SpacetimeDB session token on reconnect).
+#[cfg(target_arch = "wasm32")]
+fn connect_with(shared: Rc<RefCell<ConnState>>, token: String) {
+    *shared.borrow_mut() = ConnState::Connecting;
+    let sh = shared.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let token: Option<String> = LocalStorage::get(TOKEN_KEY).ok();
         let builder = DbConnection::builder()
             .with_uri(HOST)
             .with_database_name(DB_NAME)
-            .with_token(token)
+            .with_token(Some(token))
             .on_connect(|conn, _identity, token| {
-                let _ = LocalStorage::set(TOKEN_KEY, token);
+                // Persist the SpacetimeDB session token so a reload reconnects
+                // without bouncing through Discord (it preserves the OIDC
+                // identity via the iss/sub claims).
+                crate::auth::store_token(token);
                 // Always-on, cheap metadata subscriptions. The heavy
                 // `song_chunk` table is subscribed per-project in
                 // `sync_subscriptions`.
@@ -128,8 +178,13 @@ fn connect(shared: Rc<RefCell<ConnState>>) {
             })
             .on_connect_error(|_ctx, err| log::error!("connect error: {err}"));
         match builder.build().await {
-            Ok(conn) => *shared.borrow_mut() = ConnState::Connected(conn),
-            Err(e) => *shared.borrow_mut() = ConnState::Failed(format!("{e}")),
+            Ok(conn) => *sh.borrow_mut() = ConnState::Connected(conn),
+            Err(e) => {
+                // The token may be expired/invalid — drop it so the login screen
+                // offers a clean retry instead of looping on a dead token.
+                crate::auth::clear_token();
+                *sh.borrow_mut() = ConnState::Failed(format!("{e}"));
+            }
         }
     });
 }

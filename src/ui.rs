@@ -803,6 +803,17 @@ pub fn ui_system(
     });
     let guard = conn.state.borrow();
     match &*guard {
+        ConnState::NeedsLogin => login_screen(ctx, None),
+        ConnState::Authenticating => {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label("Signing you in…");
+                    });
+                });
+            });
+        }
         ConnState::Connecting => {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
@@ -810,18 +821,42 @@ pub fn ui_system(
                 });
             });
         }
-        ConnState::Failed(e) => {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.colored_label(Color32::LIGHT_RED, format!("Connection failed:\n{e}"));
-                });
-            });
-        }
+        ConnState::Failed(e) => login_screen(ctx, Some(e)),
         ConnState::Connected(c) => {
             ui_connected(ctx, c, &mut app, &mut playback, &upload, &audio);
         }
     }
     Ok(())
+}
+
+/// Full-screen login gate (shown until we have a working connection). `error`
+/// is set when a previous attempt failed (expired token, network, etc.).
+fn login_screen(ctx: &egui::Context, error: Option<&str>) {
+    egui::CentralPanel::default().show(ctx, |ui| {
+        ui.centered_and_justified(|ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.30);
+                ui.heading("🎚 Light Show Editor");
+                ui.add_space(8.0);
+                ui.label("Sign in to create and edit light shows.");
+                ui.add_space(16.0);
+                let btn = egui::Button::new(
+                    egui::RichText::new("🎮  Log in with Discord").size(18.0),
+                )
+                .min_size(Vec2::new(240.0, 44.0))
+                .fill(Color32::from_rgb(88, 101, 242)); // Discord blurple
+                if ui.add(btn).clicked() {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::auth::login();
+                }
+                if let Some(e) = error {
+                    ui.add_space(14.0);
+                    ui.colored_label(Color32::LIGHT_RED, e);
+                    ui.weak("Try logging in again.");
+                }
+            });
+        });
+    });
 }
 
 fn ui_connected(
@@ -833,6 +868,20 @@ fn ui_connected(
     audio: &AudioPlayback,
 ) {
     let me = conn.try_identity();
+
+    // Display name for the top bar: Discord username when we have it, else the
+    // short identity hash.
+    let display = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::auth::stored_username()
+                .unwrap_or_else(|| format!("id {}", short_id(me.as_ref())))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            format!("id {}", short_id(me.as_ref()))
+        }
+    };
 
     // Show the user's own projects *and* every seeded sample show (templates are
     // owned by the seeder but visible to everyone, read-only until forked).
@@ -855,7 +904,12 @@ fn ui_connected(
             }
             ui.heading("🎚 Light Show Editor");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(format!("id {}", short_id(me.as_ref())));
+                if ui.button("Log out").on_hover_text("Sign out of this device").clicked() {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::auth::logout();
+                }
+                ui.label(egui::RichText::new(&display).strong())
+                    .on_hover_text(format!("id {}", short_id(me.as_ref())));
                 ui.colored_label(Color32::from_rgb(120, 220, 120), "● live");
                 ui.separator();
                 ui.add(

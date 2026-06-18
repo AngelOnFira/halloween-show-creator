@@ -46,11 +46,20 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen-futures = "0.4"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+# SpacetimeAuth (OIDC) login: hand-rolled Authorization-Code + PKCE flow (see
+# src/auth.rs). `sha2`/`base64` build the S256 PKCE challenge; `gloo-net` does
+# the browser `fetch` POST to the token endpoint. No React / oidc-client-ts.
+sha2 = "0.10"
+base64 = "0.22"
+gloo-net = { version = "0.6", default-features = false, features = ["http"] }
 # Async file picker (wasm: an <input type=file> under the hood).
 rfd = "0.15"
 web-sys = { version = "0.3", features = [
     "Window",
     "Storage",
+    # OIDC login: redirect (Location), strip the ?code callback (History).
+    "Location",
+    "History",
     # Web Audio: decode uploaded songs and play them back in sync.
     "AudioContext",
     "BaseAudioContext",
