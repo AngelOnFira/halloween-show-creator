@@ -16,7 +16,11 @@ mod projector_patterns;
 mod scene;
 mod state;
 mod ui;
+mod upload;
 
+use bevy::asset::io::memory::{Dir, MemoryAssetReader};
+use bevy::asset::io::AssetSourceBuilder;
+use bevy::asset::AssetApp;
 use bevy::prelude::*;
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
@@ -26,7 +30,16 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
+    // In-memory asset source backing runtime `.glb` uploads. Registered before
+    // the AssetPlugin (in DefaultPlugins) so `upload://…` paths resolve.
+    let upload_dir = Dir::default();
+    let reader_dir = upload_dir.clone();
+
     App::new()
+        .register_asset_source(
+            "upload",
+            AssetSourceBuilder::new(move || Box::new(MemoryAssetReader { root: reader_dir.clone() })),
+        )
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -53,7 +66,12 @@ fn main() {
         .init_resource::<PlayheadTime>()
         .init_resource::<EmitterPlacements>()
         .init_resource::<cookies::PatternCookies>()
+        .init_resource::<scene::DemoMode>()
         .init_resource::<scene::CameraOrbit>()
+        .insert_resource(upload::SceneUpload {
+            dir: upload_dir,
+            version: 0,
+        })
         .add_systems(Startup, scene::setup_scene_3d)
         .add_systems(Startup, cookies::generate_cookies)
         .add_systems(Startup, conn::setup_connection)
@@ -83,7 +101,12 @@ fn main() {
                 .chain(),
         )
         .add_systems(Update, (scene::camera_drag, scene::orbit_camera).chain())
+        .add_systems(Update, scene::camera_zoom)
+        .add_systems(Update, scene::toggle_demo)
+        .add_systems(Update, upload::drive_glb_upload)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
         .add_systems(EguiPrimaryContextPass, scene::draw_projector_label)
+        .add_systems(EguiPrimaryContextPass, scene::draw_demo_overlay)
+        .add_systems(EguiPrimaryContextPass, upload::upload_ui)
         .run();
 }

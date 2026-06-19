@@ -22,9 +22,10 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_log",
     "bevy_state",
     "std",
-    # WebGPU (not WebGL2) so we get real volumetric fog / light shafts on wasm —
-    # bevy_light's volumetric module requires WebGPU on the web. Narrows browser
-    # support to WebGPU-capable browsers.
+    # WebGPU: more modern, better perf headroom, and keeps true volumetric beams
+    # on the table for later. NOTE: in dev, after a rebuild do a HARD refresh
+    # (Ctrl+Shift+R) — a soft reload can reuse the old canvas's GPU context and
+    # panic in wgpu's surface creation ("canvas context is not a GPUCanvasContext").
     "webgpu",
     # Spotlight gobo/cookie projection (SpotLightTexture) — off by default.
     "pbr_light_textures",

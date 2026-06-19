@@ -13,7 +13,7 @@
 
 use bevy::asset::LoadState;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
-use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::SpotLightTexture;
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
@@ -48,6 +48,12 @@ pub struct LightFixture {
     pub index: u32,
 }
 
+/// Marks every entity spawned for the loaded scene (glTF meshes, fixtures, emitter
+/// lights + bodies) so they can be despawned when a new `.glb` is uploaded. The
+/// app-provided camera, walls, and floor are NOT tagged (they persist).
+#[derive(Component)]
+pub struct SceneSpawned;
+
 /// Which rich-fixture family a spawned `SpotLight` emitter belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EmitterFamily {
@@ -68,8 +74,19 @@ pub struct Emitter {
 /// Spotlight intensities (lumens) for the emitter families. Tuned for the small
 /// stage; refined alongside the volumetric beams.
 const TURRET_INTENSITY: f32 = 400_000.0;
-const LASER_INTENSITY: f32 = 200_000.0;
-const PROJECTOR_INTENSITY: f32 = 400_000.0;
+// Wider laser/projector cones spread their lumens over more wall, so they need
+// more intensity than the tight turret beams to read clearly.
+const LASER_INTENSITY: f32 = 700_000.0;
+const PROJECTOR_INTENSITY: f32 = 800_000.0;
+
+/// Demo mode: when active, every emitter is driven by a synthetic animation
+/// (turrets sweep, lasers cycle patterns, projector cycles colour) instead of the
+/// project's timeline, so each fixture type can be verified in isolation. Toggle
+/// with the `D` key.
+#[derive(Resource, Default)]
+pub struct DemoMode {
+    pub active: bool,
+}
 
 /// Tracks the glTF scene load so we spawn fixtures exactly once.
 #[derive(Resource)]
@@ -130,18 +147,11 @@ impl Default for SceneConfig {
 }
 
 /// Startup: camera, key light, and kick off the glTF load. The set geometry
-/// (fixtures + house) comes entirely from the Blender scene; the glTF carries no
-/// lights, so we add one directional key light here.
-pub fn setup_scene_3d(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
+/// (stage, walls, fixtures) comes entirely from the Blender scene; the glTF
+/// carries no lights, so we add one directional key light here.
+pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
     // `orbit_camera` overwrites this transform every frame; the starting values
     // just give a sensible first frame before the orbit resource is read.
-    // HDR + a depth prepass are needed by the volumetric-fog beams; MSAA off keeps
-    // the prepass simple; a low ambient keeps the dark stage from going pure black.
     commands.spawn((
         Camera3d::default(),
         Hdr,
@@ -158,29 +168,6 @@ pub fn setup_scene_3d(
             ..default()
         },
         Transform::from_xyz(3.0, 8.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-
-    // A dark back wall + floor so the spotlights have surfaces to land on (and the
-    // laser shapes have a wall to project onto). Harmless extra geometry if the
-    // Blender scene already supplies its own stage.
-    let surface = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.06, 0.06, 0.08),
-        perceptual_roughness: 0.95,
-        ..default()
-    });
-    // Back wall: face at z ≈ -4.1, where the lasers/projector aim.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(40.0, 24.0, 0.4))),
-        MeshMaterial3d(surface.clone()),
-        Transform::from_xyz(0.0, 8.0, -4.3),
-        Name::new("BackWall"),
-    ));
-    // Floor at y = 0, where the turrets aim.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(40.0, 0.4, 30.0))),
-        MeshMaterial3d(surface),
-        Transform::from_xyz(0.0, -0.2, -2.0),
-        Name::new("Floor"),
     ));
 
     commands.insert_resource(GltfScene {
@@ -237,10 +224,13 @@ fn emitter_placements_from_gltf(
             continue;
         };
         let rot = node.transform.rotation;
+        // Cast along the node's local +Y (in glТF space). A Blender "Single Arrow"
+        // empty points along its local +Z, which the Z-up→Y-up export turns into
+        // glТF +Y — so the visible arrow IS the cast direction.
         let p = EmitterPlacement {
             origin: node.transform.translation,
-            forward: rot * Vec3::NEG_Z,
-            up: rot * Vec3::Y,
+            forward: rot * Vec3::Y,
+            up: rot * Vec3::Z,
             scale: 2.0,
         };
         let target = match fam {
@@ -268,7 +258,7 @@ fn spawn_emitters(
     placements: &EmitterPlacements,
 ) {
     use std::f32::consts::FRAC_PI_2;
-    let body = meshes.add(Sphere::new(0.18));
+    let body = meshes.add(Sphere::new(0.6));
     let mut spawn_one = |fam: EmitterFamily,
                          ch: usize,
                          p: &EmitterPlacement,
@@ -289,6 +279,7 @@ fn spawn_emitters(
             MeshMaterial3d(body_mat),
             Transform::from_translation(p.origin),
             Name::new(format!("{}.{ch:03}.body", fam_name(fam))),
+            SceneSpawned,
         ));
         // Additive cone showing the beam in the air. The `Cone` primitive points
         // +Y with its apex at +height/2; rotate +Y -> +Z and shift back by
@@ -299,9 +290,17 @@ fn spawn_emitters(
             radius: beam_radius,
             height: beam_len,
         });
+        // A faint cool-white shaft so the beam reads as light, not coloured
+        // geometry; the spotlight itself carries the colour onto surfaces. Keep a
+        // faint hint of the family tint near white.
         let beam_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(lm.red, lm.green, lm.blue, 0.18),
-            emissive: LinearRgba::rgb(lm.red * 0.25, lm.green * 0.25, lm.blue * 0.25),
+            base_color: Color::srgba(
+                0.75 + lm.red * 0.25,
+                0.78 + lm.green * 0.22,
+                0.85 + lm.blue * 0.15,
+                0.07,
+            ),
+            emissive: LinearRgba::rgb(0.12, 0.13, 0.16),
             alpha_mode: AlphaMode::Add,
             cull_mode: None,
             unlit: true,
@@ -327,6 +326,7 @@ fn spawn_emitters(
                 channel: ch as u8,
             },
             Name::new(format!("{}.{ch:03}.light", fam_name(fam))),
+            SceneSpawned,
         ));
         entity.with_children(|parent| {
             parent.spawn((
@@ -344,14 +344,17 @@ fn spawn_emitters(
             }
         }
     };
+    // Shadows off everywhere: WebGL2 only comfortably handles a few shadow casters,
+    // and the cones/cookies carry the look without them.
     for (i, p) in placements.turrets.iter().enumerate() {
-        spawn_one(EmitterFamily::Turret, i, p, 0.10, 0.22, true, Color::srgb(0.6, 0.85, 1.0), 8.0);
+        spawn_one(EmitterFamily::Turret, i, p, 0.12, 0.26, false, Color::srgb(0.6, 0.85, 1.0), 9.0);
     }
     for (i, p) in placements.lasers.iter().enumerate() {
-        spawn_one(EmitterFamily::Laser, i, p, 0.03, 0.10, false, Color::srgb(0.4, 1.0, 0.5), 9.0);
+        // A wide-ish cone so the projected gobo shape is large enough to read.
+        spawn_one(EmitterFamily::Laser, i, p, 0.18, 0.36, false, Color::srgb(0.4, 1.0, 0.5), 11.0);
     }
     for (i, p) in placements.projectors.iter().enumerate() {
-        spawn_one(EmitterFamily::Projector, i, p, 0.18, 0.38, true, Color::srgb(0.85, 0.5, 0.9), 8.0);
+        spawn_one(EmitterFamily::Projector, i, p, 0.24, 0.5, false, Color::srgb(0.85, 0.5, 0.9), 10.0);
     }
 }
 
@@ -380,22 +383,37 @@ pub fn spawn_gltf_fixtures(
             // Seed the orbit (zoom + starting azimuth) from the Blender camera
             // node if present — it has no mesh but still appears in `gltf.nodes`
             // by name with its world transform. Pitch stays fixed at 45°.
+            // Center the orbit on the loaded content: take the AABB of every mesh
+            // + emitter node, orbit around its center, and frame it by distance.
+            // The Blender camera node (if any) only sets the starting azimuth.
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            let mut cam_pos: Option<Vec3> = None;
             for node_handle in &gltf.nodes {
                 let Some(node) = gltf_nodes.get(node_handle) else {
                     continue;
                 };
-                if node.mesh.is_none() && node.name.starts_with("Camera") {
-                    let d = node.transform.translation - orbit.center;
-                    orbit.radius = d.length();
-                    orbit.base_angle = d.x.atan2(d.z);
-                    info!(
-                        "seeded camera orbit from glTF node '{}': radius {:.2}, base_angle {:.1}°",
-                        node.name,
-                        orbit.radius,
-                        orbit.base_angle.to_degrees()
-                    );
-                    break;
+                let t = node.transform.translation;
+                if node.mesh.is_some() || parse_emitter(&node.name).is_some() {
+                    min = min.min(t);
+                    max = max.max(t);
+                } else if node.name.starts_with("Camera") {
+                    cam_pos = Some(t);
                 }
+            }
+            if min.x.is_finite() {
+                let center = (min + max) * 0.5;
+                orbit.center = center;
+                // Frame the whole scene with margin (scroll wheel adjusts live).
+                orbit.radius = ((max - min).length() * 1.2).max(5.0);
+                if let Some(cam) = cam_pos {
+                    let d = cam - center;
+                    orbit.base_angle = d.x.atan2(d.z);
+                }
+                info!(
+                    "framed orbit on scene: center ({:.1}, {:.1}, {:.1}), radius {:.1}",
+                    center.x, center.y, center.z, orbit.radius
+                );
             }
             // Spawn every mesh node (so the whole Blender scene is visible);
             // nodes named `Light.<n>` become toggleable fixtures, everything
@@ -403,6 +421,13 @@ pub fn spawn_gltf_fixtures(
             // node transforms are used directly.)
             let mut light_count = 0u32;
             let mut mesh_count = 0u32;
+            // Fallback material for static meshes that ship without one (Bevy's PBR
+            // pipeline skips meshes that have no material, making them invisible).
+            let default_static = materials.add(StandardMaterial {
+                base_color: Color::srgb(0.5, 0.5, 0.55),
+                perceptual_roughness: 0.9,
+                ..default()
+            });
             for node_handle in &gltf.nodes {
                 let Some(node) = gltf_nodes.get(node_handle) else {
                     continue;
@@ -418,6 +443,7 @@ pub fn spawn_gltf_fixtures(
                         Mesh3d(prim.mesh.clone()),
                         node.transform,
                         Name::new(node.name.clone()),
+                        SceneSpawned,
                     ));
                     match light_index {
                         Some(index) => {
@@ -433,10 +459,10 @@ pub fn spawn_gltf_fixtures(
                             light_count += 1;
                         }
                         None => {
-                            // Static set geometry: use the glTF material as-is.
-                            if let Some(m) = &prim.material {
-                                entity.insert(MeshMaterial3d(m.clone()));
-                            }
+                            // Static set geometry: the glTF material, or the
+                            // fallback so material-less meshes still render.
+                            let mat = prim.material.clone().unwrap_or_else(|| default_static.clone());
+                            entity.insert(MeshMaterial3d(mat));
                         }
                     }
                 }
@@ -492,6 +518,7 @@ fn spawn_procedural(
             Transform::from_xyz(x, 0.6, 0.0),
             Name::new(format!("Light.{i:03}")),
             LightFixture { index: i },
+            SceneSpawned,
         ));
     }
 }
@@ -540,6 +567,23 @@ pub fn camera_drag(
     if dx != 0.0 {
         app.camera_angle = (app.camera_angle - dx * DRAG_SENSITIVITY).rem_euclid(360.0);
     }
+}
+
+/// Scroll wheel zooms the orbit (dollies the camera in/out), unless the pointer is
+/// over an egui panel.
+pub fn camera_zoom(
+    mut contexts: EguiContexts,
+    scroll: Res<AccumulatedMouseScroll>,
+    mut orbit: ResMut<CameraOrbit>,
+) {
+    let over_ui = contexts
+        .ctx_mut()
+        .map(|c| c.wants_pointer_input())
+        .unwrap_or(false);
+    if over_ui || scroll.delta.y == 0.0 {
+        return;
+    }
+    orbit.radius = (orbit.radius * (1.0 - scroll.delta.y * 0.1)).clamp(2.0, 2000.0);
 }
 
 /// Recompute the held on/off grid for the open project (read by the 3D apply
@@ -735,9 +779,11 @@ fn laser_color(r: u8, g: u8, b: u8) -> Color {
 /// values (0..=255).
 fn turret_dir_f(pan: f32, tilt: f32) -> Vec3 {
     let yaw = (pan / 255.0 - 0.5) * std::f32::consts::PI; // ±90°
-    let pitch = (tilt / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90° downward
+    let pitch = (tilt / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90°
     let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
-    (rot * Vec3::NEG_Y).normalize()
+    // Aim from +Y (180° flip of the original -Y base) so the heads point the
+    // right way up in the scene.
+    (rot * Vec3::Y).normalize()
 }
 
 /// Gobo projector DMX colour byte → a display colour.
@@ -749,6 +795,8 @@ fn gobo_color(colour: u8) -> Color {
 /// (0 = off), colour, and — for turrets — the eased aim at the continuous
 /// playhead so the cone sweeps smoothly. Runs after `recompute_fixtures`.
 pub fn update_emitters(
+    time: Res<Time>,
+    demo: Res<DemoMode>,
     app: Res<AppState>,
     fx: Res<FixtureGrid>,
     placements: Res<EmitterPlacements>,
@@ -763,9 +811,47 @@ pub fn update_emitters(
     )>,
 ) {
     let has_project = app.open_project.is_some();
+    let demo_t = time.elapsed_secs();
     for (em, mut light, mut tf, mut vis, tex) in &mut q {
         let mut lit = false;
-        if has_project {
+        if demo.active {
+            // Synthetic animation so every fixture type is visibly exercised.
+            match em.family {
+                EmitterFamily::Turret => {
+                    let ph = demo_t * 0.9 + em.channel as f32 * 1.2;
+                    let pan = (127.0 + 115.0 * ph.sin()).clamp(0.0, 255.0);
+                    let tilt = (140.0 + 90.0 * (ph * 0.6).cos()).clamp(0.0, 255.0);
+                    if let Some(p) = placements.turrets.get(em.channel as usize) {
+                        let dir = turret_dir_f(pan, tilt);
+                        let up = if dir.dot(Vec3::Y).abs() > 0.95 {
+                            Vec3::Z
+                        } else {
+                            Vec3::Y
+                        };
+                        *tf = Transform::from_translation(p.origin).looking_to(dir, up);
+                    }
+                    light.color = Color::srgb(0.7, 0.85, 1.0);
+                    light.intensity = TURRET_INTENSITY;
+                    lit = true;
+                }
+                EmitterFamily::Laser => {
+                    let count = cookies.images.len().max(1);
+                    let pat = ((demo_t * 0.8) as usize + em.channel as usize) % count;
+                    light.color =
+                        Color::hsl((demo_t * 40.0 + em.channel as f32 * 70.0) % 360.0, 0.9, 0.6);
+                    light.intensity = LASER_INTENSITY;
+                    if let (Some(mut tex), Some(h)) = (tex, cookies.images.get(pat)) {
+                        tex.image = h.clone();
+                    }
+                    lit = true;
+                }
+                EmitterFamily::Projector => {
+                    light.color = Color::hsl((demo_t * 30.0) % 360.0, 0.8, 0.6);
+                    light.intensity = PROJECTOR_INTENSITY;
+                    lit = true;
+                }
+            }
+        } else if has_project {
             match em.family {
                 EmitterFamily::Turret => {
                     if let Some(pose) = turret_pose_at(&fx.turret_rows, em.channel, playhead.t) {
@@ -847,17 +933,10 @@ pub fn draw_projector_label(
     let Some(p) = placements.projectors.first() else {
         return;
     };
-    // Intersect the projector's forward ray with the back wall plane.
-    const WALL_Z: f32 = -4.1;
-    let denom = p.forward.z;
-    if denom.abs() < 1e-4 {
-        return;
-    }
-    let t = (WALL_Z - p.origin.z) / denom;
-    if t <= 0.0 {
-        return;
-    }
-    let hit = p.origin + p.forward * t;
+    // Anchor the label out along the projector's beam (roughly where it lands on
+    // the wall it faces). A fixed throw avoids needing a raycast against geometry.
+    const THROW: f32 = 18.0;
+    let hit = p.origin + p.forward.normalize_or_zero() * THROW;
 
     let Ok((camera, cam_tf)) = cam.single() else {
         return;
@@ -887,4 +966,37 @@ pub fn draw_projector_label(
         egui::FontId::proportional(18.0),
         col,
     );
+}
+
+/// Toggle the fixture demo with the `D` key (ignored while typing in a text box).
+pub fn toggle_demo(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut contexts: EguiContexts,
+    mut demo: ResMut<DemoMode>,
+) {
+    let typing = contexts
+        .ctx_mut()
+        .map(|c| c.wants_keyboard_input())
+        .unwrap_or(false);
+    if !typing && keys.just_pressed(KeyCode::KeyD) {
+        demo.active = !demo.active;
+    }
+}
+
+/// Show a banner while the fixture demo is running.
+pub fn draw_demo_overlay(mut contexts: EguiContexts, demo: Res<DemoMode>) {
+    if !demo.active {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("demo_overlay"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+        .show(ctx, |ui| {
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 230, 255),
+                "DEMO MODE — every fixture is animating · press D to exit",
+            );
+        });
 }
