@@ -91,6 +91,9 @@ const GALVO_CENTER: f32 = 150.0;
 /// Half-angle (radians) of the galvo scan fan — controls the pattern size on the
 /// wall (smaller = more focused).
 const LASER_HALF_ANGLE: f32 = 0.13;
+/// Radians per text unit for the projector's wall text (≈ glyph height); larger =
+/// bigger text.
+const TEXT_SCALE: f32 = 0.03;
 
 /// Demo mode: when active, every emitter is driven by a synthetic animation
 /// (turrets sweep, lasers cycle patterns, projector cycles colour) instead of the
@@ -163,6 +166,8 @@ impl Default for SceneConfig {
 /// (stage, walls, fixtures) comes entirely from the Blender scene; the glTF
 /// carries no lights, so we add one directional key light here.
 pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // Black world background so the (ambient-lit) walls stand out against it.
+    commands.insert_resource(ClearColor(Color::BLACK));
     // `orbit_camera` overwrites this transform every frame; the starting values
     // just give a sensible first frame before the orbit resource is read.
     commands.spawn((
@@ -363,7 +368,8 @@ fn spawn_emitters(
         spawn_one(EmitterFamily::Laser, i, p, 0.18, 0.36, false, Color::srgb(0.4, 1.0, 0.5), 11.0, false);
     }
     for (i, p) in placements.projectors.iter().enumerate() {
-        spawn_one(EmitterFamily::Projector, i, p, 0.24, 0.5, false, Color::srgb(0.85, 0.5, 0.9), 10.0, true);
+        // No cone: the projector's pattern name is drawn on the wall instead.
+        spawn_one(EmitterFamily::Projector, i, p, 0.24, 0.5, false, Color::srgb(0.85, 0.5, 0.9), 10.0, false);
     }
 }
 
@@ -1023,7 +1029,7 @@ pub fn draw_laser_patterns(
         let hits: Vec<Vec3> = pts
             .iter()
             .map(|pt| {
-                let nx = (pt.x as f32 - GALVO_CENTER) / GALVO_CENTER;
+                let nx = -((pt.x as f32 - GALVO_CENTER) / GALVO_CENTER);
                 let ny = (pt.y as f32 - GALVO_CENTER) / GALVO_CENTER;
                 let q = Quat::from_axis_angle(up, nx * half)
                     * Quat::from_axis_angle(right, -ny * half);
@@ -1054,61 +1060,75 @@ pub fn draw_laser_patterns(
     }
 }
 
-/// Draw the gobo projector's "Pattern N" title as a screen-space label anchored
-/// where its beam meets the back wall. Uses an egui overlay since the trimmed
-/// feature set has no in-world text.
-pub fn draw_projector_label(
-    mut contexts: EguiContexts,
+/// Draw the gobo projector's pattern NAME as uppercase vector text on the wall it
+/// faces (raycast + gizmo lines, like the laser patterns). Runs after
+/// `recompute_fixtures`.
+pub fn draw_projector_pattern(
+    time: Res<Time>,
+    demo: Res<DemoMode>,
     app: Res<AppState>,
     fx: Res<FixtureGrid>,
     placements: Res<EmitterPlacements>,
-    cam: Query<(&Camera, &GlobalTransform), With<OrbitCamera>>,
+    walls: Query<(&GlobalTransform, &Aabb), With<StaticGeometry>>,
+    mut gizmos: Gizmos,
 ) {
-    if app.open_project.is_none() {
-        return;
-    }
-    let Some(Some(pr)) = fx.projectors.first() else {
-        return;
-    };
-    if pr.state == 0 {
-        return;
-    }
+    let demo_t = time.elapsed_secs();
     let Some(p) = placements.projectors.first() else {
         return;
     };
-    // Anchor the label out along the projector's beam (roughly where it lands on
-    // the wall it faces). A fixed throw avoids needing a raycast against geometry.
-    const THROW: f32 = 18.0;
-    let hit = p.origin + p.forward.normalize_or_zero() * THROW;
 
-    let Ok((camera, cam_tf)) = cam.single() else {
-        return;
-    };
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
-    let Ok(px) = camera.world_to_viewport(cam_tf, hit) else {
-        return; // behind camera / off screen
-    };
-    let ppp = ctx.pixels_per_point();
-    let pos = egui::pos2(px.x / ppp, px.y / ppp);
-    let c = gobo_color(pr.colour).to_srgba();
-    let col = egui::Color32::from_rgb(
-        (c.red * 255.0) as u8,
-        (c.green * 255.0) as u8,
-        (c.blue * 255.0) as u8,
-    );
-    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("projector_label"));
-    let painter = ctx.layer_painter(layer);
-    painter.text(
-        pos,
-        egui::Align2::CENTER_CENTER,
-        crate::projector_patterns::name_for(pr.gallery, pr.pattern)
+    // Resolve the lit projector's name + colour (mirrors `update_emitters` gating).
+    let (name, color): (String, Color) = if demo.active {
+        let lib = crate::projector_patterns::library();
+        let name = if lib.is_empty() {
+            "DEMO".to_string()
+        } else {
+            lib[((demo_t * 0.5) as usize) % lib.len()].name.clone()
+        };
+        (name, Color::hsl((demo_t * 30.0) % 360.0, 0.8, 0.6))
+    } else if app.open_project.is_some() {
+        let Some(Some(pr)) = fx.projectors.first() else {
+            return;
+        };
+        if pr.state == 0 {
+            return;
+        }
+        let name = crate::projector_patterns::name_for(pr.gallery, pr.pattern)
             .map(str::to_string)
-            .unwrap_or_else(|| format!("Pattern {}", pr.pattern)),
-        egui::FontId::proportional(18.0),
-        col,
-    );
+            .unwrap_or_else(|| format!("PATTERN {}", pr.pattern));
+        (name, gobo_color(pr.colour))
+    } else {
+        return;
+    };
+
+    let origin = p.origin;
+    let fwd = p.forward.normalize_or_zero();
+    if fwd == Vec3::ZERO {
+        return;
+    }
+    // Upright basis (same as the laser patterns).
+    let mut right = fwd.cross(Vec3::Y);
+    if right.length_squared() < 1e-6 {
+        right = fwd.cross(Vec3::Z);
+    }
+    let right = right.normalize_or_zero();
+    let up = right.cross(fwd).normalize_or_zero();
+    if right == Vec3::ZERO || up == Vec3::ZERO {
+        return;
+    }
+
+    // Map a text-space point onto the wall: a small fan about `forward`. Negate the
+    // horizontal to match the laser flip; centre the glyph cell vertically.
+    let to_wall = |tx: f32, ty: f32| -> Vec3 {
+        let q = Quat::from_axis_angle(up, -tx * TEXT_SCALE)
+            * Quat::from_axis_angle(right, (ty - 0.5) * TEXT_SCALE);
+        let dir = (q * fwd).normalize_or_zero();
+        raycast_walls(origin, dir, &walls).unwrap_or(origin + dir * LASER_MAX_THROW)
+    };
+
+    for (a, b) in crate::stick_font::layout(&name) {
+        gizmos.line(to_wall(a.0, a.1), to_wall(b.0, b.1), color);
+    }
 }
 
 /// Toggle the fixture demo with the `D` key (ignored while typing in a text box).

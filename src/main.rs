@@ -14,6 +14,7 @@ mod patterns;
 mod projector_patterns;
 mod scene;
 mod state;
+mod stick_font;
 mod ui;
 mod upload;
 
@@ -94,6 +95,7 @@ fn main() {
                 scene::recompute_fixtures,
                 scene::update_emitters,
                 scene::draw_laser_patterns,
+                scene::draw_projector_pattern,
                 scene::apply_lights,
             )
                 .chain(),
@@ -103,7 +105,6 @@ fn main() {
         .add_systems(Update, scene::toggle_demo)
         .add_systems(Update, upload::drive_glb_upload)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
-        .add_systems(EguiPrimaryContextPass, scene::draw_projector_label)
         .add_systems(EguiPrimaryContextPass, scene::draw_demo_overlay)
         .add_systems(EguiPrimaryContextPass, upload::upload_ui)
         .run();
