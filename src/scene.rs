@@ -13,19 +13,23 @@
 
 use bevy::asset::LoadState;
 use bevy::camera::primitives::Aabb;
+use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{CameraOutputMode, ClearColorConfig, Viewport};
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::math::bounding::{Aabb3d, RayCast3d};
 use bevy::prelude::*;
+use bevy::render::render_resource::BlendState;
 use bevy::render::view::Hdr;
-use bevy_egui::{egui, EguiContexts};
+use bevy::window::PrimaryWindow;
+use bevy_egui::{egui, EguiContexts, PrimaryEguiContext};
 
 use crate::conn::{ConnResource, ConnState};
 use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes, turret_pose_at};
 use crate::module_bindings::*;
 use crate::state::{
     AppState, EmitterPlacement, EmitterPlacements, FixtureGrid, HeldGrid, PendingFixture, Playback,
-    PlayheadTime,
+    PlayheadTime, Viewport3dRect,
 };
 use spacetimedb_sdk::{DbContext, Table};
 
@@ -93,7 +97,7 @@ const GALVO_CENTER: f32 = 150.0;
 const LASER_HALF_ANGLE: f32 = 0.13;
 /// Radians per text unit for the projector's wall text (≈ glyph height); larger =
 /// bigger text.
-const TEXT_SCALE: f32 = 0.03;
+const TEXT_SCALE: f32 = 0.06;
 
 /// Demo mode: when active, every emitter is driven by a synthetic animation
 /// (turrets sweep, lasers cycle patterns, projector cycles colour) instead of the
@@ -180,6 +184,27 @@ pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
         },
         Transform::from_xyz(0.0, 3.5, 13.0).looking_at(Vec3::new(0.0, 0.6, 0.0), Vec3::Y),
         OrbitCamera,
+    ));
+    // Dedicated full-window camera that hosts the egui overlay (the primary egui
+    // context, since `auto_create_primary_context` is disabled). Kept separate from
+    // the 3D orbit camera so clipping that camera's viewport in `apply_3d_viewport`
+    // doesn't shrink egui's surface. `RenderLayers::none()` means it draws no world
+    // geometry, only egui; `CameraOutputMode::Write` with alpha blending composites
+    // that egui over the 3D camera's output (a plain clear would paint the un-painted
+    // central region — where the 3D shows — black). Renders after the 3D (`order: 1`).
+    commands.spawn((
+        PrimaryEguiContext,
+        Camera2d::default(),
+        RenderLayers::none(),
+        Camera {
+            order: 1,
+            output_mode: CameraOutputMode::Write {
+                blend_state: Some(BlendState::ALPHA_BLENDING),
+                clear_color: ClearColorConfig::None,
+            },
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            ..default()
+        },
     ));
     commands.spawn((
         DirectionalLight {
@@ -599,6 +624,35 @@ pub fn camera_zoom(
         return;
     }
     orbit.radius = (orbit.radius * (1.0 - scroll.delta.y * 0.1)).clamp(2.0, 2000.0);
+}
+
+/// Clip the orbit camera to the egui central area (`Viewport3dRect`, written by
+/// `ui::ui_system` each frame) so the scene renders — and orbits about its centre
+/// — inside the gap between the panels instead of the full window. `None` (login /
+/// project picker) → full-window render, harmlessly hidden behind the opaque panel.
+/// `camera_system` (PostUpdate) reads this viewport to re-fit the aspect and clamp it.
+pub fn apply_3d_viewport(
+    vp: Res<Viewport3dRect>,
+    window: Query<&Window, With<PrimaryWindow>>,
+    mut cam: Query<&mut Camera, With<OrbitCamera>>,
+) {
+    let Ok(win) = window.single() else {
+        return;
+    };
+    let (pw, ph) = (win.physical_width(), win.physical_height());
+    for mut camera in &mut cam {
+        camera.viewport = vp.rect.map(|(pos, size)| {
+            let x = (pos.x.max(0.0) as u32).min(pw.saturating_sub(1));
+            let y = (pos.y.max(0.0) as u32).min(ph.saturating_sub(1));
+            let w = (size.x as u32).clamp(1, pw.saturating_sub(x).max(1));
+            let h = (size.y as u32).clamp(1, ph.saturating_sub(y).max(1));
+            Viewport {
+                physical_position: UVec2::new(x, y),
+                physical_size: UVec2::new(w, h),
+                depth: 0.0..1.0,
+            }
+        });
+    }
 }
 
 /// Recompute the held on/off grid for the open project (read by the 3D apply

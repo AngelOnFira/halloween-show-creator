@@ -329,6 +329,15 @@ pub struct PlayheadTime {
     pub t: f32,
 }
 
+/// Physical-pixel rect (position, size) of the 3D viewport = the egui central
+/// area left uncovered by panels. `None` when the UI covers the whole window
+/// (login / project picker) — then the camera renders full-window behind the
+/// opaque panel. Written by `ui::ui_system`, read by `scene::apply_3d_viewport`.
+#[derive(Resource, Default)]
+pub struct Viewport3dRect {
+    pub rect: Option<(Vec2, Vec2)>,
+}
+
 /// Where an emitter (laser / turret / projector) sits in the world and which way
 /// it casts at rest. Populated from named glTF nodes when present, else the
 /// built-in defaults below. `forward`/`up` are unit vectors; `scale` hints at the

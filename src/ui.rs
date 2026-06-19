@@ -17,7 +17,7 @@ use crate::logic::{
 use crate::module_bindings::*;
 use crate::state::{
     AppState, Clipboard, DragKind, FixtureEditor, FixtureKind, GridSelection, PendingFixture,
-    Playback, TimelineFilter,
+    Playback, TimelineFilter, Viewport3dRect,
 };
 use spacetimedb_sdk::{DbContext, Table};
 
@@ -828,6 +828,7 @@ pub fn ui_system(
     mut playback: ResMut<Playback>,
     upload: NonSend<UploadState>,
     audio: NonSend<AudioPlayback>,
+    mut vp: ResMut<Viewport3dRect>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     // Bump the default text sizes up a touch for readability (idempotent: we set
@@ -866,6 +867,19 @@ pub fn ui_system(
             ui_connected(ctx, c, &mut app, &mut playback, &upload, &audio);
         }
     }
+    // All panels are laid out now, so `available_rect` is the central region left
+    // for the 3D scene (editor mode) — or empty when a full CentralPanel covers the
+    // window (login / picker), giving `None`. Convert egui points to physical pixels
+    // for `scene::apply_3d_viewport`. (egui's `Vec2` is in scope here, so the resource
+    // tuple is built with bevy's `Vec2` explicitly.)
+    let avail = ctx.available_rect();
+    let ppp = ctx.pixels_per_point();
+    vp.rect = (avail.width() > 1.0 && avail.height() > 1.0).then(|| {
+        (
+            bevy::math::Vec2::new(avail.min.x * ppp, avail.min.y * ppp),
+            bevy::math::Vec2::new(avail.width() * ppp, avail.height() * ppp),
+        )
+    });
     Ok(())
 }
 

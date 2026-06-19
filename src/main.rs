@@ -22,9 +22,11 @@ use bevy::asset::io::memory::{Dir, MemoryAssetReader};
 use bevy::asset::io::AssetSourceBuilder;
 use bevy::asset::AssetApp;
 use bevy::prelude::*;
-use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
+use bevy_egui::{EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass};
 
-use state::{AppState, EmitterPlacements, FixtureGrid, HeldGrid, Playback, PlayheadTime};
+use state::{
+    AppState, EmitterPlacements, FixtureGrid, HeldGrid, Playback, PlayheadTime, Viewport3dRect,
+};
 
 fn main() {
     #[cfg(target_arch = "wasm32")]
@@ -59,6 +61,15 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin::default())
+        // Host egui on a dedicated full-window camera (spawned in `setup_scene_3d`)
+        // rather than auto-attaching the primary context to the first camera (our
+        // 3D orbit camera). bevy_egui derives egui's screen rect from its context
+        // camera's viewport, so sharing the orbit camera would make `apply_3d_viewport`
+        // shrink egui's own surface every frame — a runaway resize feedback loop.
+        .insert_resource(EguiGlobalSettings {
+            auto_create_primary_context: false,
+            ..Default::default()
+        })
         .init_resource::<AppState>()
         .init_resource::<HeldGrid>()
         .init_resource::<FixtureGrid>()
@@ -67,6 +78,7 @@ fn main() {
         .init_resource::<EmitterPlacements>()
         .init_resource::<scene::DemoMode>()
         .init_resource::<scene::CameraOrbit>()
+        .init_resource::<Viewport3dRect>()
         .insert_resource(upload::SceneUpload {
             dir: upload_dir,
             version: 0,
@@ -105,6 +117,12 @@ fn main() {
         .add_systems(Update, scene::toggle_demo)
         .add_systems(Update, upload::drive_glb_upload)
         .add_systems(EguiPrimaryContextPass, ui::ui_system)
+        // Runs right after `ui_system` (same nested schedule) so it reads the central
+        // rect that frame; `camera_system` (PostUpdate) then re-fits the camera to it.
+        .add_systems(
+            EguiPrimaryContextPass,
+            scene::apply_3d_viewport.after(ui::ui_system),
+        )
         .add_systems(EguiPrimaryContextPass, scene::draw_demo_overlay)
         .add_systems(EguiPrimaryContextPass, upload::upload_ui)
         .run();
