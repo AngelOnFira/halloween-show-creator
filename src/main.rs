@@ -7,7 +7,6 @@ mod audio;
 #[cfg(target_arch = "wasm32")]
 mod auth;
 mod conn;
-mod cookies;
 mod export;
 mod logic;
 mod module_bindings;
@@ -65,7 +64,6 @@ fn main() {
         .init_resource::<Playback>()
         .init_resource::<PlayheadTime>()
         .init_resource::<EmitterPlacements>()
-        .init_resource::<cookies::PatternCookies>()
         .init_resource::<scene::DemoMode>()
         .init_resource::<scene::CameraOrbit>()
         .insert_resource(upload::SceneUpload {
@@ -73,7 +71,6 @@ fn main() {
             version: 0,
         })
         .add_systems(Startup, scene::setup_scene_3d)
-        .add_systems(Startup, cookies::generate_cookies)
         .add_systems(Startup, conn::setup_connection)
         .add_systems(Startup, audio::setup_audio)
         .add_systems(PreUpdate, conn::pump_connection)
@@ -96,6 +93,7 @@ fn main() {
                 scene::publish_playhead,
                 scene::recompute_fixtures,
                 scene::update_emitters,
+                scene::draw_laser_patterns,
                 scene::apply_lights,
             )
                 .chain(),

@@ -12,14 +12,13 @@
 //! set each fixture's emissive accordingly.
 
 use bevy::asset::LoadState;
+use bevy::camera::primitives::Aabb;
 use bevy::gltf::{Gltf, GltfMesh, GltfNode};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
-use bevy::light::SpotLightTexture;
+use bevy::math::bounding::{Aabb3d, RayCast3d};
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bevy_egui::{egui, EguiContexts};
-
-use crate::cookies::PatternCookies;
 
 use crate::conn::{ConnResource, ConnState};
 use crate::logic::{apply_pending, expand_held, fold_fixtures, fold_keyframes, turret_pose_at};
@@ -54,6 +53,11 @@ pub struct LightFixture {
 #[derive(Component)]
 pub struct SceneSpawned;
 
+/// Marks static set geometry (the glTF walls/floor) that the laser raycast
+/// (`draw_laser_patterns`) projects patterns onto.
+#[derive(Component)]
+pub struct StaticGeometry;
+
 /// Which rich-fixture family a spawned `SpotLight` emitter belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EmitterFamily {
@@ -78,6 +82,15 @@ const TURRET_INTENSITY: f32 = 400_000.0;
 // more intensity than the tight turret beams to read clearly.
 const LASER_INTENSITY: f32 = 700_000.0;
 const PROJECTOR_INTENSITY: f32 = 800_000.0;
+
+/// Laser pattern projection (`draw_laser_patterns`).
+/// Max throw when a laser ray misses all walls (pattern fans into the air).
+const LASER_MAX_THROW: f32 = 40.0;
+/// Galvo coordinate centre (≈ GALVO_MAX/2); points map symmetric about this.
+const GALVO_CENTER: f32 = 150.0;
+/// Half-angle (radians) of the galvo scan fan — controls the pattern size on the
+/// wall (smaller = more focused).
+const LASER_HALF_ANGLE: f32 = 0.13;
 
 /// Demo mode: when active, every emitter is driven by a synthetic animation
 /// (turrets sweep, lasers cycle patterns, projector cycles colour) instead of the
@@ -155,8 +168,9 @@ pub fn setup_scene_3d(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn((
         Camera3d::default(),
         Hdr,
+        // A bit of global fill so unlit wall faces read as dim grey, not black.
         AmbientLight {
-            brightness: 40.0,
+            brightness: 220.0,
             ..default()
         },
         Transform::from_xyz(0.0, 3.5, 13.0).looking_at(Vec3::new(0.0, 0.6, 0.0), Vec3::Y),
@@ -254,7 +268,6 @@ fn spawn_emitters(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    cookies: &PatternCookies,
     placements: &EmitterPlacements,
 ) {
     use std::f32::consts::FRAC_PI_2;
@@ -266,7 +279,8 @@ fn spawn_emitters(
                          outer: f32,
                          shadows: bool,
                          tint: Color,
-                         beam_len: f32| {
+                         beam_len: f32,
+                         with_cone: bool| {
         let lm = tint.to_linear();
         // Always-visible marker so the placement is findable even when dark.
         let body_mat = materials.add(StandardMaterial {
@@ -281,33 +295,6 @@ fn spawn_emitters(
             Name::new(format!("{}.{ch:03}.body", fam_name(fam))),
             SceneSpawned,
         ));
-        // Additive cone showing the beam in the air. The `Cone` primitive points
-        // +Y with its apex at +height/2; rotate +Y -> +Z and shift back by
-        // height/2 so the apex sits at the fixture and the cone opens along -Z
-        // (the spotlight's forward).
-        let beam_radius = (beam_len * outer.tan()).max(0.15);
-        let beam_mesh = meshes.add(Cone {
-            radius: beam_radius,
-            height: beam_len,
-        });
-        // A faint cool-white shaft so the beam reads as light, not coloured
-        // geometry; the spotlight itself carries the colour onto surfaces. Keep a
-        // faint hint of the family tint near white.
-        let beam_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(
-                0.75 + lm.red * 0.25,
-                0.78 + lm.green * 0.22,
-                0.85 + lm.blue * 0.15,
-                0.07,
-            ),
-            emissive: LinearRgba::rgb(0.12, 0.13, 0.16),
-            alpha_mode: AlphaMode::Add,
-            cull_mode: None,
-            unlit: true,
-            ..default()
-        });
-        let beam_tf = Transform::from_translation(Vec3::new(0.0, 0.0, -beam_len / 2.0))
-            .with_rotation(Quat::from_rotation_x(FRAC_PI_2));
         let mut entity = commands.spawn((
             SpotLight {
                 color: tint,
@@ -328,33 +315,55 @@ fn spawn_emitters(
             Name::new(format!("{}.{ch:03}.light", fam_name(fam))),
             SceneSpawned,
         ));
-        entity.with_children(|parent| {
-            parent.spawn((
-                Mesh3d(beam_mesh),
-                MeshMaterial3d(beam_mat),
-                beam_tf,
-                Name::new(format!("{}.{ch:03}.beam", fam_name(fam))),
-            ));
-        });
-        // Lasers project their pattern as a gobo cookie; `update_emitters` swaps
-        // the image to the laser's current pattern. Seed with pattern 0.
-        if fam == EmitterFamily::Laser {
-            if let Some(h) = cookies.images.first() {
-                entity.insert(SpotLightTexture { image: h.clone() });
-            }
+        // Additive cone showing the beam in the air (turrets/projector only — lasers
+        // draw their pattern on the walls via `draw_laser_patterns`). The `Cone`
+        // primitive points +Y with apex at +height/2; rotate +Y -> +Z and shift back
+        // by height/2 so the apex sits at the fixture and the cone opens along -Z.
+        if with_cone {
+            let beam_radius = (beam_len * outer.tan()).max(0.15);
+            let beam_mesh = meshes.add(Cone {
+                radius: beam_radius,
+                height: beam_len,
+            });
+            // A faint cool-white shaft so the beam reads as light, not coloured
+            // geometry; the spotlight itself carries the colour onto surfaces.
+            let beam_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(
+                    0.75 + lm.red * 0.25,
+                    0.78 + lm.green * 0.22,
+                    0.85 + lm.blue * 0.15,
+                    0.07,
+                ),
+                emissive: LinearRgba::rgb(0.12, 0.13, 0.16),
+                alpha_mode: AlphaMode::Add,
+                cull_mode: None,
+                unlit: true,
+                ..default()
+            });
+            let beam_tf = Transform::from_translation(Vec3::new(0.0, 0.0, -beam_len / 2.0))
+                .with_rotation(Quat::from_rotation_x(FRAC_PI_2));
+            entity.with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(beam_mesh),
+                    MeshMaterial3d(beam_mat),
+                    beam_tf,
+                    Name::new(format!("{}.{ch:03}.beam", fam_name(fam))),
+                ));
+            });
         }
     };
     // Shadows off everywhere: WebGL2 only comfortably handles a few shadow casters,
-    // and the cones/cookies carry the look without them.
+    // and the cones / wall patterns carry the look without them.
     for (i, p) in placements.turrets.iter().enumerate() {
-        spawn_one(EmitterFamily::Turret, i, p, 0.12, 0.26, false, Color::srgb(0.6, 0.85, 1.0), 9.0);
+        // Tight, long beam.
+        spawn_one(EmitterFamily::Turret, i, p, 0.05, 0.10, false, Color::srgb(0.6, 0.85, 1.0), 18.0, true);
     }
     for (i, p) in placements.lasers.iter().enumerate() {
-        // A wide-ish cone so the projected gobo shape is large enough to read.
-        spawn_one(EmitterFamily::Laser, i, p, 0.18, 0.36, false, Color::srgb(0.4, 1.0, 0.5), 11.0);
+        // No cone: lasers draw their pattern on the walls instead.
+        spawn_one(EmitterFamily::Laser, i, p, 0.18, 0.36, false, Color::srgb(0.4, 1.0, 0.5), 11.0, false);
     }
     for (i, p) in placements.projectors.iter().enumerate() {
-        spawn_one(EmitterFamily::Projector, i, p, 0.24, 0.5, false, Color::srgb(0.85, 0.5, 0.9), 10.0);
+        spawn_one(EmitterFamily::Projector, i, p, 0.24, 0.5, false, Color::srgb(0.85, 0.5, 0.9), 10.0, true);
     }
 }
 
@@ -370,7 +379,6 @@ pub fn spawn_gltf_fixtures(
     gltf_nodes: Res<Assets<GltfNode>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    cookies: Res<PatternCookies>,
 ) {
     if scene.spawned {
         return;
@@ -459,10 +467,11 @@ pub fn spawn_gltf_fixtures(
                             light_count += 1;
                         }
                         None => {
-                            // Static set geometry: the glTF material, or the
-                            // fallback so material-less meshes still render.
+                            // Static set geometry (walls/floor): the glTF material,
+                            // or the fallback so material-less meshes still render.
+                            // `StaticGeometry` marks it for the laser raycast.
                             let mat = prim.material.clone().unwrap_or_else(|| default_static.clone());
-                            entity.insert(MeshMaterial3d(mat));
+                            entity.insert((MeshMaterial3d(mat), StaticGeometry));
                         }
                     }
                 }
@@ -479,7 +488,7 @@ pub fn spawn_gltf_fixtures(
             // Real spotlight emitters (lasers / turrets / gobo projector), placed
             // from any emitter nodes in the scene or the built-in defaults.
             let placements = emitter_placements_from_gltf(gltf, &gltf_nodes);
-            spawn_emitters(&mut commands, &mut meshes, &mut materials, &cookies, &placements);
+            spawn_emitters(&mut commands, &mut meshes, &mut materials, &placements);
             commands.insert_resource(placements);
             scene.spawned = true;
         }
@@ -487,7 +496,7 @@ pub fn spawn_gltf_fixtures(
             warn!("failed to load {SCENE_GLB}; using procedural fixtures");
             spawn_procedural(&mut commands, &mut meshes, &mut materials);
             let placements = EmitterPlacements::default();
-            spawn_emitters(&mut commands, &mut meshes, &mut materials, &cookies, &placements);
+            spawn_emitters(&mut commands, &mut meshes, &mut materials, &placements);
             commands.insert_resource(placements);
             scene.spawned = true;
         }
@@ -777,13 +786,36 @@ fn laser_color(r: u8, g: u8, b: u8) -> Color {
 
 /// Beam direction for a moving head from its (possibly interpolated) DMX pan/tilt
 /// values (0..=255).
-fn turret_dir_f(pan: f32, tilt: f32) -> Vec3 {
-    let yaw = (pan / 255.0 - 0.5) * std::f32::consts::PI; // ±90°
-    let pitch = (tilt / 255.0) * std::f32::consts::FRAC_PI_2; // 0..90°
-    let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
-    // Aim from +Y (180° flip of the original -Y base) so the heads point the
-    // right way up in the scene.
-    (rot * Vec3::Y).normalize()
+fn turret_aim(p: &EmitterPlacement, pan: f32, tilt: f32) -> Vec3 {
+    // Moving-head kinematics: pan sweeps about WORLD vertical, tilt about the
+    // horizontal axis perpendicular to the rest direction. Rest = the node arrow
+    // (`p.forward`), so pointing the `Turret.<n>` arrow aims the head.
+    let fwd = p.forward.normalize_or_zero();
+    if fwd == Vec3::ZERO {
+        return Vec3::NEG_Y;
+    }
+    let yaw = (pan / 255.0 - 0.5) * std::f32::consts::PI; // ±90° pan about world up
+    let pitch = (tilt / 255.0 - 0.5) * std::f32::consts::FRAC_PI_2; // ±45° tilt, centered
+    let mut right = fwd.cross(Vec3::Y);
+    if right.length_squared() < 1e-6 {
+        right = fwd.cross(Vec3::Z);
+    }
+    let right = right.normalize_or_zero();
+    let q = Quat::from_rotation_y(yaw) * Quat::from_axis_angle(right, pitch);
+    (q * fwd).normalize_or_zero()
+}
+
+/// A `looking_to` up-vector that isn't (near-)parallel to `dir`, preferring the
+/// fixture's own `up`.
+fn stable_up(up: Vec3, dir: Vec3) -> Vec3 {
+    let up = up.normalize_or_zero();
+    if up != Vec3::ZERO && up.dot(dir).abs() < 0.95 {
+        up
+    } else if dir.dot(Vec3::Y).abs() > 0.95 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    }
 }
 
 /// Gobo projector DMX colour byte → a display colour.
@@ -801,18 +833,11 @@ pub fn update_emitters(
     fx: Res<FixtureGrid>,
     placements: Res<EmitterPlacements>,
     playhead: Res<PlayheadTime>,
-    cookies: Res<PatternCookies>,
-    mut q: Query<(
-        &Emitter,
-        &mut SpotLight,
-        &mut Transform,
-        &mut Visibility,
-        Option<&mut SpotLightTexture>,
-    )>,
+    mut q: Query<(&Emitter, &mut SpotLight, &mut Transform, &mut Visibility)>,
 ) {
     let has_project = app.open_project.is_some();
     let demo_t = time.elapsed_secs();
-    for (em, mut light, mut tf, mut vis, tex) in &mut q {
+    for (em, mut light, mut tf, mut vis) in &mut q {
         let mut lit = false;
         if demo.active {
             // Synthetic animation so every fixture type is visibly exercised.
@@ -822,27 +847,20 @@ pub fn update_emitters(
                     let pan = (127.0 + 115.0 * ph.sin()).clamp(0.0, 255.0);
                     let tilt = (140.0 + 90.0 * (ph * 0.6).cos()).clamp(0.0, 255.0);
                     if let Some(p) = placements.turrets.get(em.channel as usize) {
-                        let dir = turret_dir_f(pan, tilt);
-                        let up = if dir.dot(Vec3::Y).abs() > 0.95 {
-                            Vec3::Z
-                        } else {
-                            Vec3::Y
-                        };
-                        *tf = Transform::from_translation(p.origin).looking_to(dir, up);
+                        let dir = turret_aim(p, pan, tilt);
+                        *tf = Transform::from_translation(p.origin)
+                            .looking_to(dir, stable_up(p.up, dir));
                     }
                     light.color = Color::srgb(0.7, 0.85, 1.0);
                     light.intensity = TURRET_INTENSITY;
                     lit = true;
                 }
                 EmitterFamily::Laser => {
-                    let count = cookies.images.len().max(1);
-                    let pat = ((demo_t * 0.8) as usize + em.channel as usize) % count;
+                    // Glow only; the pattern is drawn on the walls by
+                    // `draw_laser_patterns` (which computes its own demo pattern).
                     light.color =
                         Color::hsl((demo_t * 40.0 + em.channel as f32 * 70.0) % 360.0, 0.9, 0.6);
                     light.intensity = LASER_INTENSITY;
-                    if let (Some(mut tex), Some(h)) = (tex, cookies.images.get(pat)) {
-                        tex.image = h.clone();
-                    }
                     lit = true;
                 }
                 EmitterFamily::Projector => {
@@ -857,15 +875,9 @@ pub fn update_emitters(
                     if let Some(pose) = turret_pose_at(&fx.turret_rows, em.channel, playhead.t) {
                         if pose.on {
                             if let Some(p) = placements.turrets.get(em.channel as usize) {
-                                let dir = turret_dir_f(pose.pan, pose.tilt);
-                                // Pick a non-parallel up so `looking_to` stays stable
-                                // whether the head points down or out.
-                                let up = if dir.dot(Vec3::Y).abs() > 0.95 {
-                                    Vec3::Z
-                                } else {
-                                    Vec3::Y
-                                };
-                                *tf = Transform::from_translation(p.origin).looking_to(dir, up);
+                                let dir = turret_aim(p, pose.pan, pose.tilt);
+                                *tf = Transform::from_translation(p.origin)
+                                    .looking_to(dir, stable_up(p.up, dir));
                             }
                             light.color = Color::srgb(0.6, 0.85, 1.0);
                             light.intensity = TURRET_INTENSITY;
@@ -876,14 +888,9 @@ pub fn update_emitters(
                 EmitterFamily::Laser => {
                     if let Some(Some(l)) = fx.lasers.get(em.channel as usize) {
                         if l.enable {
+                            // Glow only; pattern drawn on walls by `draw_laser_patterns`.
                             light.color = laser_color(l.cr, l.cg, l.cb);
                             light.intensity = LASER_INTENSITY;
-                            // Project the laser's current pattern as a gobo cookie.
-                            if let (Some(mut tex), Some(h)) =
-                                (tex, cookies.images.get(l.pattern as usize))
-                            {
-                                tex.image = h.clone();
-                            }
                             lit = true;
                         }
                     }
@@ -908,6 +915,142 @@ pub fn update_emitters(
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+/// Nearest forward hit of a world ray against the static wall AABBs (world space).
+/// Casts in each wall's local space (via the inverse `GlobalTransform`) so rotated
+/// or non-uniformly-scaled walls are handled correctly.
+fn raycast_walls(
+    origin: Vec3,
+    dir: Vec3,
+    walls: &Query<(&GlobalTransform, &Aabb), With<StaticGeometry>>,
+) -> Option<Vec3> {
+    let dir_n = dir.normalize_or_zero();
+    if dir_n == Vec3::ZERO {
+        return None;
+    }
+    let mut best: Option<f32> = None;
+    for (gt, aabb) in walls.iter() {
+        let inv = gt.affine().inverse();
+        let local_o = inv.transform_point3(origin);
+        let local_d = inv.transform_vector3(dir);
+        let Ok(local_dir) = Dir3::new(local_d) else {
+            continue;
+        };
+        let local_aabb = Aabb3d::new(aabb.center, aabb.half_extents);
+        let ray = RayCast3d::new(local_o, local_dir, f32::MAX);
+        if let Some(t_local) = ray.aabb_intersection_at(&local_aabb) {
+            let local_hit = local_o + local_dir * t_local;
+            let world_hit = gt.affine().transform_point3(local_hit);
+            let t_world = (world_hit - origin).dot(dir_n);
+            if t_world > 0.01 && best.is_none_or(|b| t_world < b) {
+                best = Some(t_world);
+            }
+        }
+    }
+    best.map(|t| origin + dir_n * t)
+}
+
+/// Draw each lit laser's pattern onto the walls it points at: the outline is raycast
+/// point-by-point onto the static geometry (so the shape drapes over surfaces), plus
+/// faint beams from the fixture to each hit (a "firing" look). Runs after
+/// `recompute_fixtures` (reads the folded `fx.lasers`).
+pub fn draw_laser_patterns(
+    time: Res<Time>,
+    demo: Res<DemoMode>,
+    app: Res<AppState>,
+    fx: Res<FixtureGrid>,
+    placements: Res<EmitterPlacements>,
+    walls: Query<(&GlobalTransform, &Aabb), With<StaticGeometry>>,
+    mut gizmos: Gizmos,
+) {
+    use crate::patterns::{self, PatternPoint};
+    let demo_t = time.elapsed_secs();
+    for (ch, p) in placements.lasers.iter().enumerate() {
+        // Resolve on/off + colour + the pattern's points (mirrors `update_emitters`).
+        let (points, color): (&[PatternPoint], Color) = if demo.active {
+            let lib = patterns::library();
+            let pat = ((demo_t * 0.8) as usize + ch) % lib.len().max(1);
+            let color = Color::hsl((demo_t * 40.0 + ch as f32 * 70.0) % 360.0, 0.9, 0.6);
+            (&lib[pat].points, color)
+        } else if app.open_project.is_some() {
+            let Some(Some(l)) = fx.lasers.get(ch) else {
+                continue;
+            };
+            if !l.enable {
+                continue;
+            }
+            let Some(pat) = patterns::get(l.pattern) else {
+                continue;
+            };
+            (&pat.points, laser_color(l.cr, l.cg, l.cb))
+        } else {
+            continue;
+        };
+
+        // Filtered point list, exactly as `outline_segments` sees it.
+        let pts: Vec<PatternPoint> = points
+            .iter()
+            .copied()
+            .filter(|q| !(q.x == 0 && q.y == 0 && patterns::is_blank(q)))
+            .collect();
+        if pts.len() < 2 {
+            continue;
+        }
+
+        let origin = p.origin;
+        let fwd = p.forward.normalize_or_zero();
+        if fwd == Vec3::ZERO {
+            continue;
+        }
+        // Upright basis: keep the pattern's "up" aligned with world vertical so the
+        // shape isn't rolled by the fixture's orientation (fixes the 90° rotation).
+        let mut right = fwd.cross(Vec3::Y);
+        if right.length_squared() < 1e-6 {
+            right = fwd.cross(Vec3::Z);
+        }
+        let right = right.normalize_or_zero();
+        let up = right.cross(fwd).normalize_or_zero();
+        if right == Vec3::ZERO || up == Vec3::ZERO {
+            continue;
+        }
+        let half = LASER_HALF_ANGLE;
+
+        // World hit for each filtered point (index-aligned with `pts`): map the galvo
+        // coord to a ray direction (a small fan about `forward`) and raycast the walls.
+        // Galvo Y increases downward, so negate it to keep the shape upright.
+        let hits: Vec<Vec3> = pts
+            .iter()
+            .map(|pt| {
+                let nx = (pt.x as f32 - GALVO_CENTER) / GALVO_CENTER;
+                let ny = (pt.y as f32 - GALVO_CENTER) / GALVO_CENTER;
+                let q = Quat::from_axis_angle(up, nx * half)
+                    * Quat::from_axis_angle(right, -ny * half);
+                let dir = (q * fwd).normalize_or_zero();
+                raycast_walls(origin, dir, &walls).unwrap_or(origin + dir * LASER_MAX_THROW)
+            })
+            .collect();
+
+        // Faint beams from the fixture to each wall hit, flickering in/out per beam
+        // so they only show occasionally (a laser-shimmer "firing" look). Keep the
+        // laser colour but drop the alpha so they fade into the background rather
+        // than darkening toward black.
+        let faint = color.with_alpha(0.3);
+        for (i, h) in hits.iter().enumerate() {
+            if (demo_t * 20.0 + ch as f32 * 4.3 + i as f32 * 2.1).sin() > 0.6 {
+                gizmos.line(origin, *h, faint);
+            }
+        }
+
+        // The pattern outline draped on the walls (closed loop; skip pen-up sources).
+        let n = pts.len();
+        for i in 0..n {
+            if patterns::is_blank(&pts[i]) {
+                continue;
+            }
+            gizmos.line(hits[i], hits[(i + 1) % n], color);
+        }
     }
 }
 

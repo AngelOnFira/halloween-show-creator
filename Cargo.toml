@@ -16,6 +16,9 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_core_pipeline",
     "bevy_pbr",
     "bevy_gizmos",
+    # The actual gizmo *rendering* (separate from the `bevy_gizmos` API feature);
+    # without it `gizmos.line(...)` runs but draws nothing.
+    "bevy_gizmos_render",
     "bevy_gltf",
     "bevy_scene",
     "bevy_asset",
