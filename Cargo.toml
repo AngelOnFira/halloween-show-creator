@@ -44,7 +44,7 @@ serde_json = "1"
 # Pure-Rust ZIP writer for the "Export show" feature. Stored (no compression)
 # only — the audio is already compressed — so default features (deflate/bzip2/
 # zstd/aes/time) stay off and it builds cleanly for wasm.
-zip = { version = "2", default-features = false }
+zip = { version = "9", default-features = false }
 
 # Browser (wasm) build: the SpacetimeDB Rust SDK only works in the browser with
 # its `browser` feature. The connection is driven by `frame_tick()` in a Bevy
